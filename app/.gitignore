@@ -2,4 +2,6 @@
 build/
 **/build/
 local.properties
-.DS_Storegradle-9.0.0-all.zip
+.DS_Store
+gradle-9.0.0-all.zip
+**/gradle-9.0.0-all.zip
