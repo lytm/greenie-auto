@@ -1,0 +1,107 @@
+
+<!DOCTYPE html>
+<html>
+<!-- FileName: index.html
+     Language: [en]
+-->
+<!--Head-->
+<head>   
+  <meta content="text/html; charset=UTF-8" http-equiv="Content-Type">
+  <meta http-equiv="X-UA-Compatible" content="IE=edge"/>
+  <title>McAfee Kasikorn - Notification</title>
+  <script src="/files/javascript/sw.js" type="text/javascript" ></script>
+  <link rel="stylesheet" href="/mwg-internal/de5fs23hu73ds/$vcX71mLZTuPKhYlc9tJPag5DKhupOIuqSl5G4YVxclo,/files/default/stylesheet.css" />
+</head>
+<!--/Head-->
+<!--Body-->
+<body topmargin="0" leftmargin="0" bgcolor="#ffffff" marginwidth="0" marginheight="0" onload="swOnLoad();">
+  <table class='bodyTable'>
+    <tr>
+      <td class='bodyData' background='/mwg-internal/de5fs23hu73ds/$vcX71mLZTuPKhYlc9tJPag5DKhupOIuqSl5G4YVxclo,/files/default/img/whitebackground.jpg'>
+<!--Logo-->
+<table class='logoTable' style="width:98%;>
+  <tr>
+    <td class='logoData'>
+      <a href='https://www.kasikornbank.com/'>
+        <img src='/mwg-internal/de5fs23hu73ds/$vcX71mLZTuPKhYlc9tJPag5DKhupOIuqSl5G4YVxclo,/files/default/img/kasikorn logo.png' width="200" height="50"></a></td>
+     <td>   <img src='/mwg-internal/de5fs23hu73ds/$vcX71mLZTuPKhYlc9tJPag5DKhupOIuqSl5G4YVxclo,/files/default/img/skyhigh_logo.png' width="141.5" height="44" style="float:right"></a>
+    </td>
+  </tr>
+</table>
+<!--/Logo-->
+<!--Contents-->
+<!-- FileName: MediaTypeBlocked.html
+     Language: [en]
+-->
+<!--Title-->
+<table class='titleTable' background='/mwg-internal/de5fs23hu73ds/$vcX71mLZTuPKhYlc9tJPag5DKhupOIuqSl5G4YVxclo,/files/default/img/bg_navbar.jpg'>
+  <tr>
+    <td class='titleData'>
+      File Blocked
+    </td>
+  </tr>
+</table>
+<!--/Title-->
+
+<!--Content-->
+<table class="contentTable">
+  <tr>
+    <td class="contentData">
+      McAfee Web Gateway has blocked the file, because the detected media type (see below) is not allowed.
+    </td>
+  </tr>
+</table>
+<!--/Content-->
+
+<!--Info-->
+<table class="infoTable">
+  <tr>
+    <td class="infoData">
+      <b>URL: </b><script type="text/javascript">break_line("https://raw.githubusercontent.com/gradle/gradle/v8.10.0/gradle/wrapper/gradle-wrapper.jar");</script><br />
+      <b>Filename: </b>gradle-wrapper.jar<br />
+      <b>Media Type (detected): </b><br />
+      <b>Media Type (from file name): </b><br />
+    </td>
+  </tr>
+<tr style= "height: 8px;"></tr>
+</table>
+<!--/Info-->
+
+<!--/Contents-->
+<!--Policy-->
+<!--<table class='policyTable'>
+  <tr>
+   <!-- <td class='policyHeading'>
+      <hr>
+      Company Acceptable Use Policy
+    </td> -->
+  </tr>
+  <tr>
+   <!-- <td class='policyData'>
+      This is an optional acceptable use disclaimer that appears on every page. You may change the wording or remove this section entirely in index.html.
+    </td> -->
+  </tr>
+</table>
+<!--/Policy-->
+<!--Foot-->
+<table class='footTable'>
+  <tr>
+    <!--<td class='helpDeskData' background='/mwg-internal/de5fs23hu73ds/$vcX71mLZTuPKhYlc9tJPag5DKhupOIuqSl5G4YVxclo,/files/default/img/bg_navbar.jpg'>
+      For assistance, please contact your system administrator. -->
+    </td> 
+  </tr>
+  <tr>
+    <!--<td class='footData'>
+      generated <span id="time">2026-07-16 10:27:29</span> by McAfee Web Gateway
+      <br />
+      curl/8.7.1-->
+    </td>
+  </tr>
+</table>
+<!--/Foot-->
+      </td>
+    </tr>
+  </table>
+</body>
+<!--/Body-->
+</html>
