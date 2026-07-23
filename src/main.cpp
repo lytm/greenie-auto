@@ -1,7 +1,12 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
 #include <WiFiManager.h>      // Nhập SSID/Pass từ điện thoại, không cần code cứng
+
+// ─── FIREBASE REALTIME DATABASE ─────────────────────────────────
+// ↳ FIREBASE_URL và FIREBASE_SECRET được truyền từ platformio.ini (build_flags)
+//   ⇒ Sửa credentials trong platformio.ini, không để lộ trong code
 
 // ─── NÚT RESET WIFI ─────────────────────────────────────────────
 // Giữ nút BOOT (GPIO 0) > 3 giây sau khi ESP32 đã chạy để xóa WiFi đã lưu.
@@ -124,7 +129,55 @@ void handlePump() {
     server.sendHeader("Location", "/");
     server.send(303);
 }
+// ─── FIREBASE: ĐẨY DỮ LIỆU CẢM BIẾN LÊN CLOUD ─────────────────────
+// Cấu trúc tự tạo trong Firebase:
+// {
+//   "sensor_data": { "sensor1": 45, "sensor2": 60, "average": 52, "pump": false,
+//                    "threshold_on": 30, "threshold_off": 70 },
+//   "pump_command": null
+// }
+void pushToFirebase(int pct1, int pct2, int avg, bool pump) {
+    if (WiFi.status() != WL_CONNECTED) return;
+    HTTPClient http;
+    String url = String(FIREBASE_URL) + "/sensor_data.json?auth=" + FIREBASE_SECRET;
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    String body = String("{")
+        + "\"sensor1\":"       + String(pct1)  + ","
+        + "\"sensor2\":"       + String(pct2)  + ","
+        + "\"average\":"       + String(avg)   + ","
+        + "\"pump\":"          + String(pump ? "true" : "false") + ","
+        + "\"threshold_on\":"  + String(PUMP_ON_THRESHOLD)  + ","
+        + "\"threshold_off\":" + String(PUMP_OFF_THRESHOLD)
+        + "}";
+    int code = http.PATCH(body);
+    if (code > 0) Serial.printf("[Firebase] ✅ Đẩy OK (HTTP %d)\n", code);
+    else          Serial.printf("[Firebase] ❌ Lỗi: %s\n", http.errorToString(code).c_str());
+    http.end();
+}
 
+// ─── FIREBASE: NHẬN LỆNH BƠM TỪ APP ───────────────────────────
+void checkPumpCommand() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    HTTPClient http;
+    http.begin(String(FIREBASE_URL) + "/pump_command.json?auth=" + FIREBASE_SECRET);
+    int code = http.GET();
+    if (code == 200) {
+        String payload = http.getString();
+        if (payload != "null" && payload.length() > 2) {
+            bool newState = (payload.indexOf("\"on\"") >= 0);
+            pumpRunning = newState;
+            digitalWrite(PUMP_PIN, pumpRunning ? PUMP_ON : PUMP_OFF);
+            Serial.printf("[Firebase] 📱 Lệnh bơm từ app: %s\n", pumpRunning ? "BẬT" : "TẮT");
+            // Xóa lệnh sau khi thực hiện
+            http.end();
+            http.begin(String(FIREBASE_URL) + "/pump_command.json?auth=" + FIREBASE_SECRET);
+            http.addHeader("Content-Type", "application/json");
+            http.PUT("null");
+        }
+    }
+    http.end();
+}
 // ─── SETUP ───────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
@@ -241,6 +294,10 @@ void loop() {
     int pct2 = toPercent(readSensor(SOIL_PIN_2));
     int avgPct = (pct1 + pct2) / 2;
     lastPct1 = pct1; lastPct2 = pct2; lastAvg = avgPct;   // Lưu cho web
+
+    // Đẩy lên Firebase & kiểm tra lệnh điều khiển từ app
+    pushToFirebase(pct1, pct2, avgPct, pumpRunning);
+    checkPumpCommand();
 
     // Nhãn trạng thái
     auto label = [](int p) -> const char* {
