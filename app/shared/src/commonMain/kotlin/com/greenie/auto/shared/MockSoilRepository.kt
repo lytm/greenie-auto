@@ -5,7 +5,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlin.random.Random
 
-class MockSoilRepository : SoilRepository("http://mock") {
+class MockSoilRepository : SoilRepository() {
     private var mockPumpRunning = false
     private var mockSensor1 = 45
     private var mockSensor2 = 60
@@ -21,9 +21,11 @@ class MockSoilRepository : SoilRepository("http://mock") {
         if (mockPumpRunning && avg >= 70) mockPumpRunning = false
 
         SoilData(
-            sensor1 = mockSensor1,
-            sensor2 = mockSensor2,
+            sensorCount = 2,
+            sensors = listOf(mockSensor1, mockSensor2),
             average = avg,
+            airTemp = 27.5f,
+            airHumidity = 65.0f,
             pump = mockPumpRunning,
             thresholdOn = 30,
             thresholdOff = 70
@@ -32,5 +34,6 @@ class MockSoilRepository : SoilRepository("http://mock") {
 
     override suspend fun setPump(on: Boolean): Result<Unit> = runCatching {
         mockPumpRunning = on
+        logInfo("MockSoilRepository", "Đặt bơm thành: ${if (on) "BẬT" else "TẮT"}")
     }
 }

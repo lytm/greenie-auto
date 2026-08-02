@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="greenie_background">#12172B</color>
+    <color name="greenie_accent">#17E4BE</color>
+    <color name="greenie_text_secondary">#9CA7C2</color>
+</resources>

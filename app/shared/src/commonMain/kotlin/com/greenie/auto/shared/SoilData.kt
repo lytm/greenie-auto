@@ -5,9 +5,11 @@ import kotlinx.serialization.Serializable
 
 @Serializable
 data class SoilData(
-    @SerialName("sensor1") val sensor1: Int,
-    @SerialName("sensor2") val sensor2: Int,
+    @SerialName("sensor_count") val sensorCount: Int,
+    @SerialName("sensors") val sensors: List<Int>,
     @SerialName("average") val average: Int,
+    @SerialName("air_temp") val airTemp: Float = -1f,      // -1 = không cắm cảm biến
+    @SerialName("air_humidity") val airHumidity: Float = -1f,
     @SerialName("pump") val pump: Boolean,
     @SerialName("threshold_on") val thresholdOn: Int,
     @SerialName("threshold_off") val thresholdOff: Int

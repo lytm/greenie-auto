@@ -9,30 +9,37 @@ import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
 import kotlinx.serialization.json.Json
 
-open class SoilRepository(private val baseUrl: String) {
+// Base class cho các repository khác nhau (Firebase, Local API, Mock)
+abstract class SoilRepository {
+    abstract suspend fun fetchData(): Result<SoilData>
+    abstract suspend fun setPump(on: Boolean): Result<Unit>
+}
+
+// Repository cũ dùng local API (deprecated, giữ để reference)
+open class LocalSoilRepository(private val baseUrl: String) : SoilRepository() {
     private val client = HttpClient {
         install(ContentNegotiation) {
             json(Json { ignoreUnknownKeys = true })
         }
     }
 
-    open suspend fun fetchData(): Result<SoilData> = runCatching {
+    override suspend fun fetchData(): Result<SoilData> = runCatching {
         val resp: HttpResponse = client.get("$baseUrl/api/data")
         if (resp.status.isSuccess()) {
             resp.body()
         } else {
             val text = resp.bodyAsText()
-            logError("SoilRepository", "In response from `$baseUrl/api/data` -> status=${resp.status}, contentType=${resp.contentType()} body=$text")
+            logError("LocalSoilRepository", "In response from `$baseUrl/api/data` -> status=${resp.status}, contentType=${resp.contentType()} body=$text")
             throw Exception("HTTP ${resp.status.value} ${resp.status.description}: $text")
         }
     }
 
-    open suspend fun setPump(on: Boolean): Result<Unit> = runCatching {
+    override suspend fun setPump(on: Boolean): Result<Unit> = runCatching {
         val state = if (on) "on" else "off"
         val resp: HttpResponse = client.get("$baseUrl/api/pump") { parameter("state", state) }
         if (!resp.status.isSuccess()) {
             val text = resp.bodyAsText()
-            logError("SoilRepository", "In response from `$baseUrl/api/pump` -> status=${resp.status}, contentType=${resp.contentType()} body=$text")
+            logError("LocalSoilRepository", "In response from `$baseUrl/api/pump` -> status=${resp.status}, contentType=${resp.contentType()} body=$text")
             throw Exception("HTTP ${resp.status.value} ${resp.status.description}: $text")
         }
         Unit

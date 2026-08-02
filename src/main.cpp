@@ -2,7 +2,9 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
-#include <WiFiManager.h>      // Nhập SSID/Pass từ điện thoại, không cần code cứng
+#include <WiFiManager.h>
+#include <ESPmDNS.h>
+#include <DHT.h>              // Cảm biến không khí DHT22
 
 // ─── FIREBASE REALTIME DATABASE ─────────────────────────────────
 // ↳ FIREBASE_URL và FIREBASE_SECRET được truyền từ platformio.ini (build_flags)
@@ -16,14 +18,23 @@
 // ─── CẢM BIẾN ĐỘ ẨM (ADC1 — an toàn khi dùng WiFi/Bluetooth) ────
 // ⚠️  ADC2 bị vô hiệu hoá khi dùng WiFi/Bluetooth.
 //     Chỉ dùng ADC1: GPIO 32, 33, 34, 35, 36, 39.
-#define SOIL_PIN_1      32      // Cảm biến 1 → GPIO 32
-#define SOIL_PIN_2      33      // Cảm biến 2 → GPIO 33
+//
+// Để tối đa 6 chân — cắm cảm biến vào chân nào thì tự hiện, rút ra tự ẩn.
+// Không cần upload lại khi thêm/bớt cảm biến.
+#define SENSOR_COUNT    6       // Quét toàn bộ 6 chân ADC1
+#define MAX_SENSORS     6
+const uint8_t SOIL_PINS[SENSOR_COUNT] = {32, 33, 34, 35, 36, 39};
 
 // ─── RELAY ĐIỀU KHIỂN MÁY BƠM ────────────────────────────────────
 #define PUMP_PIN        26      // Relay IN   → GPIO 26
 #define PUMP_ON         LOW     // Relay module kích mức LOW
 #define PUMP_OFF        HIGH
-
+// ─── CẢM BIẾN KHÔNG KHÍ (DHT22) ──────────────────────────────
+// Cắm: VCC → 3.3V | GND → GND | DATA → GPIO 27
+// Không cắm → DHT đọc NaN → gửi -1 → app tự ẩn card
+#define DHT_PIN         27
+#define DHT_TYPE        DHT22
+DHT dht(DHT_PIN, DHT_TYPE);
 // ─── KHOẢNG THỜI GIAN ĐỌC (ms) ───────────────────────────────────
 #define READ_INTERVAL_MS  2000
 
@@ -36,23 +47,50 @@
 // ─── NGƯỠNG ĐIỀU KHIỂN MÁY BƠM ──────────────────────────────────
 #define PUMP_ON_THRESHOLD   30  // % — độ ẩm TB < 30% → BẬT bơm
 #define PUMP_OFF_THRESHOLD  70  // % — độ ẩm TB ≥ 70% → TẮT bơm
+// Nếu ADC thô ≥ ngưỡng này → chân thả nổi → không có cảm biến
+// Khi không cắm cảm biến, ESP32 ADC thường đọc ≈ 4000-4095
+#define NO_SENSOR_THRESHOLD 3800
 
+// ─── FIREBASE CONNECTION TIMEOUT ────────────────────────────────
+#define HTTP_TIMEOUT_MS  8000  // 8 giây timeout cho Firebase request
 // ─── HÀM CHUYỂN ĐỔI ADC → % ĐỘ ẨM ──────────────────────────────
 int toPercent(int raw) {
     return constrain(map(raw, DRY_VALUE, WET_VALUE, 0, 100), 0, 100);
 }
 
 // ─── HÀM ĐỌC TRUNG BÌNH 10 LẦN (giảm nhiễu) ─────────────────────
-int readSensor(int pin) {
+int readSensorRaw(int pin) {
     long sum = 0;
     for (int i = 0; i < 10; i++) { sum += analogRead(pin); delay(10); }
     return sum / 10;
 }
 
+int readSensors(int values[]) {
+    int active = 0;
+    for (int i = 0; i < SENSOR_COUNT; i++) {
+        int raw = readSensorRaw(SOIL_PINS[i]);
+        if (raw >= NO_SENSOR_THRESHOLD) {
+            values[i] = -1;   // không có cảm biến
+        } else {
+            values[i] = toPercent(raw);
+            active++;
+        }
+    }
+    return active;   // trả số cảm biến có tín hiệu thực sự
+}
+
+const char* sensorLabel(int p) {
+    if (p < 20) return "KHÔ  — Cần tưới!";
+    if (p < 60) return "VỪA  — Độ ẩm tốt";
+    return       "ƯỚT  — Đủ nước";
+}
+
 // ─── BIẾN TRẠNG THÁI ─────────────────────────────────────────────
 bool pumpRunning = false;
-int  lastPct1 = 0, lastPct2 = 0, lastAvg = 0;
-bool resetRequested = false;
+int  lastSensorValues[MAX_SENSORS] = {0};
+int  lastSensorCount = SENSOR_COUNT;
+int  lastAvg = 0;float lastAirTemp = -1.0f;      // -1 = không cắm DHT
+float lastAirHumidity = -1.0f;bool resetRequested = false;
 unsigned long resetStartMs = 0;
 
 // ─── WEB SERVER ──────────────────────────────────────────────────
@@ -60,8 +98,6 @@ WebServer server(80);
 String lastIpLog = "";
 // Trang HTML trả về cho trình duyệt
 void handleRoot() {
-    String color1 = lastPct1 < 30 ? "#e74c3c" : (lastPct1 < 60 ? "#f39c12" : "#27ae60");
-    String color2 = lastPct2 < 30 ? "#e74c3c" : (lastPct2 < 60 ? "#f39c12" : "#27ae60");
     String pumpStatus = pumpRunning ? "🟢 ĐANG CHẠY" : "🔴 ĐỨNG";
     String pumpBtnLabel = pumpRunning ? "Tắt bơm" : "Bật bơm";
     String pumpBtnColor = pumpRunning ? "#e74c3c" : "#27ae60";
@@ -86,8 +122,14 @@ void handleRoot() {
   <h1>🌱 greenie-auto</h1>
 )";
 
-    html += String("<div class='card'><b>Cảm biến 1</b><div class='pct' style='color:") + color1 + "'>" + String(lastPct1) + "%</div></div>";
-    html += String("<div class='card'><b>Cảm biến 2</b><div class='pct' style='color:") + color2 + "'>" + String(lastPct2) + "%</div></div>";
+    for (int i = 0; i < lastSensorCount; i++) {
+        int pct = lastSensorValues[i];
+        String color = pct < 30 ? "#e74c3c" : (pct < 60 ? "#f39c12" : "#27ae60");
+        html += String("<div class='card'><b>Cảm biến ") + String(i + 1) +
+                "</b><div class='pct' style='color:" + color + "'>" + String(pct) + "%</div>" +
+                "<div style='margin-top:8px;color:#ccc;font-size:13px'>" + String(sensorLabel(pct)) + "</div></div>";
+    }
+
     html += String("<div class='card'><b>Trung bình</b><div class='pct'>") + String(lastAvg) + "%</div></div>";
     html += String("<div class='card'><b>Máy bơm:</b> ") + pumpStatus + "<br>";
     html += String("<form action='/pump' method='POST'><button class='btn' style='background:") + pumpBtnColor + ";color:#fff'>" + pumpBtnLabel + "</button></form></div>";
@@ -99,9 +141,16 @@ void handleRoot() {
 // Endpoint JSON cho app mobile đọc real-time
 void handleApiData() {
     String json = "{";
-    json += String("\"sensor1\":") + String(lastPct1) + ",";
-    json += String("\"sensor2\":") + String(lastPct2) + ",";
+    json += String("\"sensor_count\":") + String(lastSensorCount) + ",";
+    json += "\"sensors\":[";
+    for (int i = 0; i < lastSensorCount; i++) {
+        if (i > 0) json += ",";
+        json += String(lastSensorValues[i]);
+    }
+    json += "],";
     json += String("\"average\":") + String(lastAvg) + ",";
+    json += String("\"air_temp\":") + String(lastAirTemp, 1) + ",";
+    json += String("\"air_humidity\":") + String(lastAirHumidity, 1) + ",";
     json += String("\"pump\":") + String(pumpRunning ? "true" : "false") + ",";
     json += String("\"threshold_on\":") + String(PUMP_ON_THRESHOLD) + ",";
     json += String("\"threshold_off\":") + String(PUMP_OFF_THRESHOLD);
@@ -132,49 +181,76 @@ void handlePump() {
 // ─── FIREBASE: ĐẨY DỮ LIỆU CẢM BIẾN LÊN CLOUD ─────────────────────
 // Cấu trúc tự tạo trong Firebase:
 // {
-//   "sensor_data": { "sensor1": 45, "sensor2": 60, "average": 52, "pump": false,
+//   "sensor_data": { "sensor_count": 2, "sensors": [45, 60], "average": 52, "pump": false,
 //                    "threshold_on": 30, "threshold_off": 70 },
 //   "pump_command": null
 // }
-void pushToFirebase(int pct1, int pct2, int avg, bool pump) {
-    if (WiFi.status() != WL_CONNECTED) return;
+void pushToFirebase(int avg, bool pump) {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[Firebase] ⚠️  WiFi chưa kết nối, bỏ qua đẩy dữ liệu");
+        return;
+    }
+    
     HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT_MS);  // Set timeout để tránh hang
     String url = String(FIREBASE_URL) + "/sensor_data.json?auth=" + FIREBASE_SECRET;
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
-    String body = String("{")
-        + "\"sensor1\":"       + String(pct1)  + ","
-        + "\"sensor2\":"       + String(pct2)  + ","
-        + "\"average\":"       + String(avg)   + ","
-        + "\"pump\":"          + String(pump ? "true" : "false") + ","
-        + "\"threshold_on\":"  + String(PUMP_ON_THRESHOLD)  + ","
-        + "\"threshold_off\":" + String(PUMP_OFF_THRESHOLD)
-        + "}";
-    int code = http.PATCH(body);
-    if (code > 0) Serial.printf("[Firebase] ✅ Đẩy OK (HTTP %d)\n", code);
-    else          Serial.printf("[Firebase] ❌ Lỗi: %s\n", http.errorToString(code).c_str());
+    String body = "{";
+    body += "\"sensor_count\":" + String(lastSensorCount) + ",";
+    body += "\"sensors\":[";
+    for (int i = 0; i < lastSensorCount; i++) {
+        if (i > 0) body += ",";
+        body += String(lastSensorValues[i]);
+    }
+    body += "],";
+    body += "\"average\":" + String(avg) + ",";
+    body += "\"air_temp\":" + String(lastAirTemp, 1) + ",";
+    body += "\"air_humidity\":" + String(lastAirHumidity, 1) + ",";
+    body += "\"pump\":" + String(pump ? "true" : "false") + ",";
+    body += "\"threshold_on\":" + String(PUMP_ON_THRESHOLD) + ",";
+    body += "\"threshold_off\":" + String(PUMP_OFF_THRESHOLD);
+    body += "}";
+    int code = http.PUT(body);
+    if (code > 0) {
+        Serial.printf("[Firebase] ✅ Đẩy OK (HTTP %d)\n", code);
+    } else {
+        Serial.printf("[Firebase] ❌ Lỗi: %s\n", http.errorToString(code).c_str());
+    }
     http.end();
 }
 
 // ─── FIREBASE: NHẬN LỆNH BƠM TỪ APP ───────────────────────────
 void checkPumpCommand() {
-    if (WiFi.status() != WL_CONNECTED) return;
+    if (WiFi.status() != WL_CONNECTED) {
+        return;
+    }
+    
     HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT_MS);  // Set timeout để tránh hang
     http.begin(String(FIREBASE_URL) + "/pump_command.json?auth=" + FIREBASE_SECRET);
+    http.addHeader("Content-Type", "application/json");
     int code = http.GET();
     if (code == 200) {
         String payload = http.getString();
-        if (payload != "null" && payload.length() > 2) {
+        // Payload = {"state":"on"} hoặc {"state":"off"} hoặc null
+        if (payload != "null" && payload.indexOf("state") >= 0) {
             bool newState = (payload.indexOf("\"on\"") >= 0);
             pumpRunning = newState;
             digitalWrite(PUMP_PIN, pumpRunning ? PUMP_ON : PUMP_OFF);
-            Serial.printf("[Firebase] 📱 Lệnh bơm từ app: %s\n", pumpRunning ? "BẬT" : "TẮT");
+            Serial.printf("[Firebase] 📱 Lệnh bơm từ app: %s (payload=%s)\n", pumpRunning ? "BẬT" : "TẮT", payload.c_str());
             // Xóa lệnh sau khi thực hiện
             http.end();
             http.begin(String(FIREBASE_URL) + "/pump_command.json?auth=" + FIREBASE_SECRET);
             http.addHeader("Content-Type", "application/json");
+            http.setTimeout(HTTP_TIMEOUT_MS);
             http.PUT("null");
+            return;
         }
+    } else if (code > 0) {
+        Serial.printf("[Firebase] ❌ GET /pump_command lỗi HTTP %d\n", code);
+    } else {
+        Serial.printf("[Firebase] ❌ GET /pump_command timeout/lỗi kết nối: %s\n", http.errorToString(code).c_str());
     }
     http.end();
 }
@@ -185,6 +261,7 @@ void setup() {
 
     pinMode(PUMP_PIN, OUTPUT);
     digitalWrite(PUMP_PIN, PUMP_OFF);   // Tắt bơm khi khởi động
+    dht.begin();                         // Khởi động cảm biến không khí
 
     Serial.println("============================================");
     Serial.println("  greenie-auto | 2 Cảm biến + Máy bơm");
@@ -231,6 +308,7 @@ void setup() {
     server.on("/api/pump",  HTTP_GET,  handleApiPump);
 
     WiFi.mode(WIFI_AP_STA);
+    WiFi.setHostname("greenie-auto");
     WiFiManager wm;
     wm.setConfigPortalTimeout(180);   // Tự thoát portal sau 3 phút nếu không cài
     wm.setAPStaticIPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
@@ -254,6 +332,15 @@ void setup() {
     if (!portalStarted) {
         Serial.println("[WiFi] Không thể mở portal AP. Khởi động lại...");
         ESP.restart();
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        if (MDNS.begin("greenie-auto")) {
+            MDNS.addService("http", "tcp", 80);
+            Serial.println("[mDNS] ✅ greenie-auto.local đã sẵn sàng");
+        } else {
+            Serial.println("[mDNS] ❌ Không khởi tạo được mDNS");
+        }
     }
 
     // Chỉ mở web server sau khi WiFiManager đã xử lý xong, tránh xung đột TCP/IP.
@@ -289,25 +376,39 @@ void loop() {
         resetRequested = false;
     }
 
-    // Đọc 2 cảm biến
-    int pct1 = toPercent(readSensor(SOIL_PIN_1));
-    int pct2 = toPercent(readSensor(SOIL_PIN_2));
-    int avgPct = (pct1 + pct2) / 2;
-    lastPct1 = pct1; lastPct2 = pct2; lastAvg = avgPct;   // Lưu cho web
+    // Đọc cảm biến không khí DHT22
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    lastAirTemp     = isnan(t) ? -1.0f : t;
+    lastAirHumidity = isnan(h) ? -1.0f : h;
+    if (lastAirTemp < 0)
+        Serial.println("[Không khí] Không cắm cảm biến");
+    else
+        Serial.printf("[Không khí] Nhiệt độ: %.1f°C  Độ ẩm: %.1f%%\n", lastAirTemp, lastAirHumidity);
+
+    // Đọc cảm biến theo SENSOR_COUNT
+    int values[MAX_SENSORS] = {0};
+    readSensors(values);   // -1 = không cắm cảm biến
+    lastSensorCount = SENSOR_COUNT;   // tổng số khe, gồm cả -1
+    int activeCount = 0, sum = 0;
+    for (int i = 0; i < SENSOR_COUNT; i++) {
+        lastSensorValues[i] = values[i];
+        if (values[i] >= 0) { sum += values[i]; activeCount++; }
+    }
+    int avgPct = activeCount > 0 ? sum / activeCount : 0;
+    lastAvg = avgPct;   // Lưu cho web
 
     // Đẩy lên Firebase & kiểm tra lệnh điều khiển từ app
-    pushToFirebase(pct1, pct2, avgPct, pumpRunning);
+    pushToFirebase(avgPct, pumpRunning);
     checkPumpCommand();
 
-    // Nhãn trạng thái
-    auto label = [](int p) -> const char* {
-        if (p < 20) return "KHÔ  — Cần tưới!";
-        if (p < 60) return "VỪA  — Độ ẩm tốt";
-        return           "ƯỚT  — Đủ nước";
-    };
-
-    Serial.printf("[Cảm biến 1] %3d%%  %s\n", pct1, label(pct1));
-    Serial.printf("[Cảm biến 2] %3d%%  %s\n", pct2, label(pct2));
+    for (int i = 0; i < SENSOR_COUNT; i++) {
+        if (lastSensorValues[i] < 0) {
+            Serial.printf("[Cảm biến %d] không có tín hiệu\n", i + 1);
+        } else {
+            Serial.printf("[Cảm biến %d] %3d%%  %s\n", i + 1, lastSensorValues[i], sensorLabel(lastSensorValues[i]));
+        }
+    }
     Serial.printf("[Trung bình] %3d%%\n", avgPct);
 
     String currentIp = WiFi.localIP().toString();
