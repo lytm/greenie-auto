@@ -13,6 +13,12 @@ import kotlinx.serialization.json.Json
 abstract class SoilRepository {
     abstract suspend fun fetchData(): Result<SoilData>
     abstract suspend fun setPump(on: Boolean): Result<Unit>
+
+    open suspend fun fetchMonthlyStats(): Result<MonthlyStats> =
+        Result.success(MonthlyStats(monthKey = "", days = emptyList()))
+
+    open suspend fun fetchPumpHistory(): Result<PumpHistory> =
+        Result.success(PumpHistory(entries = emptyList()))
 }
 
 // Repository cũ dùng local API (deprecated, giữ để reference)

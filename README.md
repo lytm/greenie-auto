@@ -38,7 +38,10 @@ Lưu ý: chỉ dùng ADC1 (32/33/34/35/36/39) khi chạy WiFi.
 ## 3) Cách hệ thống hoạt động
 
 ### Tự nhận biết cảm biến cắm/rút
-- Cảm biến đất: nếu ADC thô `>= NO_SENSOR_THRESHOLD` thì coi như không cắm (`-1`)
+- Cảm biến đất: coi như không cắm (`-1`) nếu:
+  - ADC thô `>= NO_SENSOR_HIGH_THRESHOLD`
+  - hoặc ADC thô `<= NO_SENSOR_LOW_THRESHOLD`
+  - hoặc độ dao động nhiều mẫu `>= NO_SENSOR_NOISE_SPAN` (chân thả nổi / nhiễu)
 - DHT22: nếu đọc lỗi (`NaN`) thì trả `air_temp = -1`, `air_humidity = -1`
 
 ### Điều khiển tưới
@@ -49,6 +52,12 @@ Lưu ý: chỉ dùng ADC1 (32/33/34/35/36/39) khi chạy WiFi.
 ### Đồng bộ dữ liệu
 - Local API: `/api/data`, `/api/pump`
 - Firebase Realtime DB: ghi vào `/sensor_data`, đọc lệnh từ `/pump_command`
+- Bản tối ưu pin hiện tại:
+  - Đọc cảm biến mỗi khoảng 10 giây
+  - Kiểm tra lệnh bơm mỗi khoảng 10 giây
+  - Đẩy Firebase mỗi khoảng 30 giây
+  - `monthly_stats` chỉ đẩy khi tới chu kỳ 5 phút, khi nhiệt độ/pump count đổi đáng kể, hoặc lúc sang ngày mới
+  - Tắt AP sau khi đã vào WiFi và bật WiFi sleep
 
 ---
 
@@ -85,13 +94,44 @@ Các hằng số quan trọng nằm trong [src/main.cpp](src/main.cpp):
 
 - `SENSOR_COUNT`, `SOIL_PINS`
 - `DRY_VALUE`, `WET_VALUE`
-- `NO_SENSOR_THRESHOLD`
+- `NO_SENSOR_HIGH_THRESHOLD`, `NO_SENSOR_LOW_THRESHOLD`, `NO_SENSOR_NOISE_SPAN`
 - `PUMP_ON_THRESHOLD`, `PUMP_OFF_THRESHOLD`
-- `READ_INTERVAL_MS`
+- `READ_INTERVAL_MS`, `FIREBASE_PUSH_INTERVAL_MS`, `PUMP_COMMAND_POLL_INTERVAL_MS`
 
 Credential Firebase truyền qua `build_flags` trong [platformio.ini](platformio.ini).
 
 > Khuyến nghị: không commit secret thật lên git public.
+
+### Firebase setup nhanh
+
+Điền vào [platformio.ini](platformio.ini):
+
+```ini
+build_flags =
+    -D FIREBASE_SECRET='"YOUR_SECRET_HERE"'
+    -D FIREBASE_URL='"https://YOUR-PROJECT-rtdb.asia-southeast1.firebasedatabase.app"'
+```
+
+Rules test nhanh cho Realtime Database:
+
+```json
+{
+  "rules": {
+    "sensor_data": {
+      ".read": true,
+      ".write": true
+    },
+    "pump_command": {
+      ".read": true,
+      ".write": true
+    },
+    "monthly_stats": {
+      ".read": true,
+      ".write": true
+    }
+  }
+}
+```
 
 ---
 
@@ -109,13 +149,38 @@ Nếu dùng macOS/Linux, nhớ chỉnh `upload_port` trong [platformio.ini](plat
 
 ## 7) App Android/iOS
 
-Xem hướng dẫn chi tiết tại [app/README.md](app/README.md).
-
 App hỗ trợ:
 - Đọc dữ liệu trực tiếp từ Firebase
 - Bật/tắt tưới từ điện thoại qua Firebase
 - Chế độ Mock để test UI khi chưa có phần cứng
 - Nút mở nhanh trang setup WiFi ESP32 (`http://192.168.4.1`)
+
+### Android
+- Mở thư mục [app](app)
+- Sync Gradle
+- Chạy module `androidApp`
+
+### iOS
+- Build framework dùng chung:
+  - `./gradlew :shared:linkDebugFrameworkIosSimulatorArm64`
+- Mở [app/iosApp/iosApp.xcodeproj](app/iosApp/iosApp.xcodeproj)
+- Chạy trên Simulator hoặc device
+
+### Cách app sync dữ liệu
+- App refresh UI mỗi 2 giây
+- Cùng WiFi: ưu tiên đọc local từ ESP32
+- Khác WiFi hoặc local lỗi: fallback sang Firebase (giảm còn 10 giây/lần để tiết kiệm quota)
+- Do firmware đang tiết kiệm pin, nếu đọc qua Firebase thì dữ liệu có thể trễ hơn local
+- Biểu đồ tháng đọc từ Firebase node `/monthly_stats/{YYYY-MM}/{DD}`:
+  - `avg_temp`: nhiệt độ trung bình ngày
+  - `avg_soil`: độ ẩm đất trung bình ngày
+  - `pump_on_count`: số lần bơm bật trong ngày
+
+### Quy ước thêm tính năng app
+- Mọi tính năng mới của app phải chạy được trên **cả Android và iOS**.
+- Nếu sửa code chung trong `shared`, bắt buộc test lại 2 nền tảng trước khi merge.
+- Nếu tính năng có phần native (permission, networking, lifecycle, background), phải cập nhật cả `androidApp` và `iosApp` tương ứng.
+- PR/commit cần ghi rõ trạng thái test: Android ✅ / iOS ✅.
 
 ---
 
@@ -143,6 +208,17 @@ App hỗ trợ:
   - Kiểm tra `FIREBASE_URL` / `FIREBASE_SECRET` trong [platformio.ini](platformio.ini).
   - Kiểm tra rules Firebase cho phép app đọc node `/sensor_data` và ghi `/pump_command`.
 
+### 8.3.1 Pre-build checklist nhanh
+- `platformio.ini` đã có `FIREBASE_URL` và `FIREBASE_SECRET`
+- Serial baud là `115200`
+- Thư viện cần có:
+  - `tzapu/WiFiManager`
+  - `adafruit/DHT sensor library`
+  - `adafruit/Adafruit Unified Sensor`
+- Sau khi upload, kiểm tra Serial có log dạng:
+  - `[WiFi] Đã có SSID lưu, thử autoConnect trước.`
+  - `[Firebase] ✅ Đẩy OK (HTTP 200)`
+
 ### 8.4 DHT22 luôn trả `-1`
 - Triệu chứng: `air_temp = -1`, `air_humidity = -1` liên tục.
 - Cách xử lý:
@@ -155,16 +231,30 @@ App hỗ trợ:
 - Cách xử lý:
   - Chỉ cắm vào chân ADC1: 32/33/34/35/36/39.
   - Kiểm tra dây `AOUT` không lỏng.
-  - Điều chỉnh `NO_SENSOR_THRESHOLD` trong [src/main.cpp](src/main.cpp) theo môi trường nhiễu thực tế.
+  - Điều chỉnh `NO_SENSOR_HIGH_THRESHOLD`, `NO_SENSOR_LOW_THRESHOLD` hoặc `NO_SENSOR_NOISE_SPAN` trong [src/main.cpp](src/main.cpp) theo môi trường nhiễu thực tế.
 
-### 8.6 Relay bật/tắt ngược kỳ vọng
+### 8.6 Dữ liệu Firebase cập nhật chậm hơn local
+- Triệu chứng: app đang fallback Firebase nhưng số liệu lên chậm hơn WiFi local.
+- Nguyên nhân: firmware đang ưu tiên tiết kiệm pin nên chỉ đẩy Firebase mỗi khoảng 30 giây; app fallback Firebase cũng chỉ refresh khoảng 10 giây/lần.
+- Cách xử lý:
+  - Nếu cần gần real-time hơn, giảm `FIREBASE_PUSH_INTERVAL_MS` trong [src/main.cpp](src/main.cpp).
+  - Nếu điện thoại cùng WiFi với ESP32, app sẽ ưu tiên đọc local nhanh hơn.
+
+### 8.7 Relay bật/tắt ngược kỳ vọng
 - Triệu chứng: gửi lệnh `on` nhưng relay lại tắt (hoặc ngược lại).
 - Nguyên nhân: nhiều relay dùng logic active-LOW.
 - Cách xử lý: kiểm tra lại `PUMP_ON` / `PUMP_OFF` trong [src/main.cpp](src/main.cpp).
 
-### 8.7 Firebase đẩy lỗi 401/403
+### 8.8 Firebase đẩy lỗi 401/403
 - Triệu chứng: Serial log báo lỗi HTTP auth khi ghi `/sensor_data`.
 - Cách xử lý:
   - Kiểm tra `FIREBASE_URL` và `FIREBASE_SECRET` trong [platformio.ini](platformio.ini).
   - Kiểm tra rules của Realtime Database cho đúng môi trường test.
   - Tránh để secret thật trong repository public.
+
+### 8.9 iOS build lỗi
+- Triệu chứng: Xcode không thấy module `shared` hoặc app iOS không build.
+- Cách xử lý:
+  - Chạy lại `./gradlew :shared:linkDebugFrameworkIosSimulatorArm64`
+  - Mở lại [app/iosApp/iosApp.xcodeproj](app/iosApp/iosApp.xcodeproj)
+  - Nếu simulator chậm, test trên device thật

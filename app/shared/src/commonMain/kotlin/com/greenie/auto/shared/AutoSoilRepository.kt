@@ -184,4 +184,20 @@ class AutoSoilRepository(
         lastFailureSummary = message
         return Result.failure(Exception(message))
     }
+
+    override suspend fun fetchMonthlyStats(): Result<MonthlyStats> {
+        val result = firebaseRepository.fetchMonthlyStats()
+        if (result.isFailure) {
+            logError("AutoSoilRepository", "fetchMonthlyStats lỗi: ${result.exceptionOrNull()?.message}")
+        }
+        return result
+    }
+
+    override suspend fun fetchPumpHistory(): Result<PumpHistory> {
+        val result = firebaseRepository.fetchPumpHistory()
+        if (result.isFailure) {
+            logError("AutoSoilRepository", "fetchPumpHistory lỗi: ${result.exceptionOrNull()?.message}")
+        }
+        return result
+    }
 }

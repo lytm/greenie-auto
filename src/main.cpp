@@ -5,6 +5,7 @@
 #include <WiFiManager.h>
 #include <ESPmDNS.h>
 #include <DHT.h>              // Cảm biến không khí DHT22
+#include <time.h>
 
 // ─── FIREBASE REALTIME DATABASE ─────────────────────────────────
 // ↳ FIREBASE_URL và FIREBASE_SECRET được truyền từ platformio.ini (build_flags)
@@ -19,9 +20,8 @@
 // ⚠️  ADC2 bị vô hiệu hoá khi dùng WiFi/Bluetooth.
 //     Chỉ dùng ADC1: GPIO 32, 33, 34, 35, 36, 39.
 //
-// Để tối đa 6 chân — cắm cảm biến vào chân nào thì tự hiện, rút ra tự ẩn.
-// Không cần upload lại khi thêm/bớt cảm biến.
-#define SENSOR_COUNT    6       // Quét toàn bộ 6 chân ADC1
+// Tối đa 6 chân ADC1 — cắm cảm biến vào chân nào thì tự hiện, rút ra tự ẩn.
+#define SENSOR_COUNT    6
 #define MAX_SENSORS     6
 const uint8_t SOIL_PINS[SENSOR_COUNT] = {32, 33, 34, 35, 36, 39};
 
@@ -35,8 +35,18 @@ const uint8_t SOIL_PINS[SENSOR_COUNT] = {32, 33, 34, 35, 36, 39};
 #define DHT_PIN         27
 #define DHT_TYPE        DHT22
 DHT dht(DHT_PIN, DHT_TYPE);
-// ─── KHOẢNG THỜI GIAN ĐỌC (ms) ───────────────────────────────────
-#define READ_INTERVAL_MS  2000
+// ─── CHẾ ĐỘ TIẾT KIỆM PIN (ms) ──────────────────────────────────
+#define READ_INTERVAL_MS               10000
+#define FIREBASE_PUSH_INTERVAL_MS      30000
+#define PUMP_COMMAND_POLL_INTERVAL_MS  10000
+#define MONTHLY_STATS_PUSH_INTERVAL_MS 300000
+#define LOOP_IDLE_MS                      50
+#define SENSOR_SAMPLE_COUNT                5
+#define TIME_SYNC_RETRY_MS             60000
+#define GMT_OFFSET_SEC                 (7 * 3600)
+#define DAYLIGHT_OFFSET_SEC            0
+#define MONTHLY_STATS_SIGNIFICANT_TEMP_DELTA_X10 5
+#define MONTHLY_STATS_SIGNIFICANT_SOIL_DELTA     2
 
 // ─── HIỆU CHỈNH (CALIBRATION) ────────────────────────────────────
 // 1. Để cảm biến trong KHÔNG KHÍ → đọc ADC → gán vào DRY_VALUE
@@ -47,9 +57,13 @@ DHT dht(DHT_PIN, DHT_TYPE);
 // ─── NGƯỠNG ĐIỀU KHIỂN MÁY BƠM ──────────────────────────────────
 #define PUMP_ON_THRESHOLD   30  // % — độ ẩm TB < 30% → BẬT bơm
 #define PUMP_OFF_THRESHOLD  70  // % — độ ẩm TB ≥ 70% → TẮT bơm
-// Nếu ADC thô ≥ ngưỡng này → chân thả nổi → không có cảm biến
-// Khi không cắm cảm biến, ESP32 ADC thường đọc ≈ 4000-4095
-#define NO_SENSOR_THRESHOLD 3800
+// Nếu ADC thô nằm ngoài dải hợp lý → coi như không có cảm biến
+// - ADC rất cao: chân thả nổi/pull-up
+// - ADC quá thấp: chân thả nổi/pull-down hoặc nhiễu
+#define NO_SENSOR_HIGH_THRESHOLD 3800
+#define NO_SENSOR_LOW_THRESHOLD   150
+// Nếu biên độ dao động ADC trong nhiều mẫu quá lớn thì thường là chân thả nổi
+#define NO_SENSOR_NOISE_SPAN      350
 
 // ─── FIREBASE CONNECTION TIMEOUT ────────────────────────────────
 #define HTTP_TIMEOUT_MS  8000  // 8 giây timeout cho Firebase request
@@ -58,18 +72,28 @@ int toPercent(int raw) {
     return constrain(map(raw, DRY_VALUE, WET_VALUE, 0, 100), 0, 100);
 }
 
-// ─── HÀM ĐỌC TRUNG BÌNH 10 LẦN (giảm nhiễu) ─────────────────────
-int readSensorRaw(int pin) {
+// ─── HÀM ĐỌC TRUNG BÌNH N LẦN (giảm nhiễu) ──────────────────────
+int readSensorRaw(int pin, int &span) {
     long sum = 0;
-    for (int i = 0; i < 10; i++) { sum += analogRead(pin); delay(10); }
-    return sum / 10;
+    int minRaw = 4095;
+    int maxRaw = 0;
+    for (int i = 0; i < SENSOR_SAMPLE_COUNT; i++) {
+        int raw = analogRead(pin);
+        sum += raw;
+        if (raw < minRaw) minRaw = raw;
+        if (raw > maxRaw) maxRaw = raw;
+        delay(8);
+    }
+    span = maxRaw - minRaw;
+    return sum / SENSOR_SAMPLE_COUNT;
 }
 
 int readSensors(int values[]) {
     int active = 0;
     for (int i = 0; i < SENSOR_COUNT; i++) {
-        int raw = readSensorRaw(SOIL_PINS[i]);
-        if (raw >= NO_SENSOR_THRESHOLD) {
+        int span = 0;
+        int raw = readSensorRaw(SOIL_PINS[i], span);
+        if (raw >= NO_SENSOR_HIGH_THRESHOLD || raw <= NO_SENSOR_LOW_THRESHOLD || span >= NO_SENSOR_NOISE_SPAN) {
             values[i] = -1;   // không có cảm biến
         } else {
             values[i] = toPercent(raw);
@@ -87,11 +111,244 @@ const char* sensorLabel(int p) {
 
 // ─── BIẾN TRẠNG THÁI ─────────────────────────────────────────────
 bool pumpRunning = false;
+time_t pumpOnStartTime = 0;   // thời điểm bơm bật (cho lịch sử tưới)
 int  lastSensorValues[MAX_SENSORS] = {0};
 int  lastSensorCount = SENSOR_COUNT;
 int  lastAvg = 0;float lastAirTemp = -1.0f;      // -1 = không cắm DHT
 float lastAirHumidity = -1.0f;bool resetRequested = false;
 unsigned long resetStartMs = 0;
+unsigned long lastReadMs = 0;
+unsigned long lastFirebasePushMs = 0;
+unsigned long lastPumpPollMs = 0;
+unsigned long lastTimeSyncAttemptMs = 0;
+unsigned long lastMonthlyStatsPushMs = 0;
+
+String statsMonthKey = "";
+String statsDayKey = "";
+long statsTempSumX10 = 0;
+int statsTempSamples = 0;
+long statsSoilSum = 0;
+int statsSoilSamples = 0;
+int statsPumpOnCount = 0;
+String pendingStatsMonthKey = "";
+String pendingStatsDayKey = "";
+long pendingStatsTempSumX10 = 0;
+int pendingStatsTempSamples = 0;
+long pendingStatsSoilSum = 0;
+int pendingStatsSoilSamples = 0;
+int pendingStatsPumpOnCount = 0;
+bool hasPendingDayStats = false;
+String lastPushedStatsMonthKey = "";
+String lastPushedStatsDayKey = "";
+int lastPushedAvgTempX10 = -10000;
+int lastPushedAvgSoil = -1;
+int lastPushedPumpOnCount = -1;
+
+int currentAvgTempX10() {
+    if (statsTempSamples <= 0) return -10;
+    return (int)(statsTempSumX10 / statsTempSamples);
+}
+
+int currentAvgSoil() {
+    if (statsSoilSamples <= 0) return -1;
+    return (int)(statsSoilSum / statsSoilSamples);
+}
+
+bool pushMonthlyStatsSnapshot(const String &monthKey, const String &dayKey, long tempSumX10, int tempSamples, long soilSum, int soilSamples, int pumpOnCount, bool forceLog) {
+    if (WiFi.status() != WL_CONNECTED || monthKey.length() == 0 || dayKey.length() == 0) {
+        return false;
+    }
+
+    HTTPClient statsHttp;
+    statsHttp.setTimeout(HTTP_TIMEOUT_MS);
+    String statsUrl = String(FIREBASE_URL) + "/monthly_stats/" + monthKey + "/" + dayKey + ".json?auth=" + FIREBASE_SECRET;
+    statsHttp.begin(statsUrl);
+    statsHttp.addHeader("Content-Type", "application/json");
+
+    float avgTemp = tempSamples > 0 ? (tempSumX10 / 10.0f) / tempSamples : -1.0f;
+    float avgSoil = soilSamples > 0 ? (float)soilSum / soilSamples : -1.0f;
+    String statsBody = "{";
+    statsBody += "\"avg_temp\":" + String(avgTemp, 1) + ",";
+    statsBody += "\"avg_soil\":" + String(avgSoil, 1) + ",";
+    statsBody += "\"temp_samples\":" + String(tempSamples) + ",";
+    statsBody += "\"pump_on_count\":" + String(pumpOnCount);
+    statsBody += "}";
+
+    int statsCode = statsHttp.PUT(statsBody);
+    bool ok = statsCode > 0;
+    if (ok) {
+        if (forceLog) {
+            Serial.printf("[Firebase] 📊 Monthly stats OK (%s/%s, HTTP %d)\n", monthKey.c_str(), dayKey.c_str(), statsCode);
+        }
+    } else {
+        Serial.printf("[Firebase] ❌ Monthly stats lỗi: %s\n", statsHttp.errorToString(statsCode).c_str());
+    }
+    statsHttp.end();
+    return ok;
+}
+
+void flushPendingDayStats() {
+    if (!hasPendingDayStats) return;
+    if (pushMonthlyStatsSnapshot(
+            pendingStatsMonthKey,
+            pendingStatsDayKey,
+            pendingStatsTempSumX10,
+            pendingStatsTempSamples,
+            pendingStatsSoilSum,
+            pendingStatsSoilSamples,
+            pendingStatsPumpOnCount,
+            true)) {
+        hasPendingDayStats = false;
+    }
+}
+
+void pushMonthlyStatsIfNeeded(bool forcePush) {
+    flushPendingDayStats();
+
+    if (statsMonthKey.length() == 0 || statsDayKey.length() == 0) return;
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    int avgTempX10 = currentAvgTempX10();
+    int avgSoil = currentAvgSoil();
+    bool sameDayAsLastPush = (lastPushedStatsMonthKey == statsMonthKey && lastPushedStatsDayKey == statsDayKey);
+    bool intervalReached = lastMonthlyStatsPushMs == 0 || millis() - lastMonthlyStatsPushMs >= MONTHLY_STATS_PUSH_INTERVAL_MS;
+    bool tempChangedSignificantly = !sameDayAsLastPush || abs(avgTempX10 - lastPushedAvgTempX10) >= MONTHLY_STATS_SIGNIFICANT_TEMP_DELTA_X10;
+    bool soilChangedSignificantly = !sameDayAsLastPush || lastPushedAvgSoil < 0 || (avgSoil >= 0 && abs(avgSoil - lastPushedAvgSoil) >= MONTHLY_STATS_SIGNIFICANT_SOIL_DELTA);
+    bool pumpCountChanged = !sameDayAsLastPush || statsPumpOnCount != lastPushedPumpOnCount;
+
+    if (!forcePush && !intervalReached && !tempChangedSignificantly && !soilChangedSignificantly && !pumpCountChanged) {
+        return;
+    }
+
+    if (pushMonthlyStatsSnapshot(statsMonthKey, statsDayKey, statsTempSumX10, statsTempSamples, statsSoilSum, statsSoilSamples, statsPumpOnCount, true)) {
+        lastMonthlyStatsPushMs = millis();
+        lastPushedStatsMonthKey = statsMonthKey;
+        lastPushedStatsDayKey = statsDayKey;
+        lastPushedAvgTempX10 = avgTempX10;
+        lastPushedAvgSoil = avgSoil;
+        lastPushedPumpOnCount = statsPumpOnCount;
+    }
+}
+
+bool getDateKeys(String &monthKey, String &dayKey) {
+    time_t now;
+    time(&now);
+    struct tm tmNow;
+    if (!localtime_r(&now, &tmNow)) return false;
+    int year = tmNow.tm_year + 1900;
+    if (year < 2024) return false;
+
+    char monthBuf[8];  // YYYY-MM
+    char dayBuf[3];    // DD
+    strftime(monthBuf, sizeof(monthBuf), "%Y-%m", &tmNow);
+    strftime(dayBuf, sizeof(dayBuf), "%d", &tmNow);
+    monthKey = String(monthBuf);
+    dayKey = String(dayBuf);
+    return true;
+}
+
+void ensureStatsDay() {
+    String month, day;
+    if (!getDateKeys(month, day)) return;
+
+    if (statsMonthKey != month || statsDayKey != day) {
+        if (statsMonthKey.length() > 0 && statsDayKey.length() > 0) {
+            pendingStatsMonthKey = statsMonthKey;
+            pendingStatsDayKey = statsDayKey;
+            pendingStatsTempSumX10 = statsTempSumX10;
+            pendingStatsTempSamples = statsTempSamples;
+            pendingStatsSoilSum = statsSoilSum;
+            pendingStatsSoilSamples = statsSoilSamples;
+            pendingStatsPumpOnCount = statsPumpOnCount;
+            hasPendingDayStats = true;
+        }
+        statsMonthKey = month;
+        statsDayKey = day;
+        statsTempSumX10 = 0;
+        statsTempSamples = 0;
+        statsSoilSum = 0;
+        statsSoilSamples = 0;
+        statsPumpOnCount = 0;
+        Serial.printf("[Stats] Chuyển ngày thống kê: %s-%s\n", statsMonthKey.c_str(), statsDayKey.c_str());
+    }
+}
+
+void recordPumpOnEventIfNeeded(bool previousState, bool newState) {
+    if (!previousState && newState) {
+        ensureStatsDay();
+        if (statsDayKey.length() > 0) {
+            statsPumpOnCount++;
+        }
+    }
+}
+
+void pushPumpHistoryEntry(time_t startTime) {
+    if (WiFi.status() != WL_CONNECTED || startTime == 0) return;
+    time_t endTime;
+    time(&endTime);
+    int durationS = (int)difftime(endTime, startTime);
+    if (durationS < 0) durationS = 0;
+
+    struct tm startTm, endTm;
+    localtime_r(&startTime, &startTm);
+    localtime_r(&endTime, &endTm);
+    if (startTm.tm_year + 1900 < 2024) return;   // NTP chưa sync
+
+    char dateBuf[11];   // YYYY-MM-DD
+    char startBuf[9];   // HH:MM:SS
+    char endBuf[9];
+    char keyBuf[7];     // HHMMSS
+    strftime(dateBuf,  sizeof(dateBuf),  "%Y-%m-%d", &startTm);
+    strftime(startBuf, sizeof(startBuf), "%H:%M:%S", &startTm);
+    strftime(endBuf,   sizeof(endBuf),   "%H:%M:%S", &endTm);
+    snprintf(keyBuf, sizeof(keyBuf), "%02d%02d%02d", startTm.tm_hour, startTm.tm_min, startTm.tm_sec);
+
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    String url = String(FIREBASE_URL) + "/pump_history/" + dateBuf + "/" + keyBuf + ".json?auth=" + FIREBASE_SECRET;
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    String body = "{\"start\":\"" + String(startBuf) + "\",\"end\":\"" + String(endBuf) + "\",\"duration_s\":" + String(durationS) + "}";
+    int code = http.PUT(body);
+    if (code > 0) {
+        Serial.printf("[Firebase] 📋 Pump history (%s %s→%s, %ds)\n", dateBuf, startBuf, endBuf, durationS);
+    } else {
+        Serial.printf("[Firebase] ❌ Pump history lỗi: %s\n", http.errorToString(code).c_str());
+    }
+    http.end();
+}
+
+void setPumpState(bool newState, const char* source) {
+    bool previous = pumpRunning;
+    pumpRunning = newState;
+    digitalWrite(PUMP_PIN, pumpRunning ? PUMP_ON : PUMP_OFF);
+    recordPumpOnEventIfNeeded(previous, newState);
+    if (!previous && newState) {
+        time(&pumpOnStartTime);            // ghi thời điểm bơm bật
+    } else if (previous && !newState) {
+        pushPumpHistoryEntry(pumpOnStartTime);  // đẩy lịch sử khi bơm tắt
+        pumpOnStartTime = 0;
+    }
+    if (previous != newState) {
+        Serial.printf("[PUMP] %s -> %s (%s)\n", previous ? "ON" : "OFF", newState ? "ON" : "OFF", source);
+    }
+}
+
+void syncTimeIfNeeded() {
+    unsigned long nowMs = millis();
+    if (lastTimeSyncAttemptMs != 0 && nowMs - lastTimeSyncAttemptMs < TIME_SYNC_RETRY_MS) {
+        return;
+    }
+
+    String month, day;
+    if (getDateKeys(month, day)) {
+        return;
+    }
+
+    lastTimeSyncAttemptMs = nowMs;
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, "pool.ntp.org", "time.google.com", "time.windows.com");
+    Serial.println("[Time] Đang đồng bộ NTP...");
+}
 
 // ─── WEB SERVER ──────────────────────────────────────────────────
 WebServer server(80);
@@ -163,8 +420,7 @@ void handleApiData() {
 void handleApiPump() {
     if (server.hasArg("state")) {
         String state = server.arg("state");
-        pumpRunning = (state == "on");
-        digitalWrite(PUMP_PIN, pumpRunning ? PUMP_ON : PUMP_OFF);
+        setPumpState(state == "on", "API");
     }
     server.sendHeader("Access-Control-Allow-Origin", "*");
     server.send(200, "application/json", String("{\"pump\":") + String(pumpRunning ? "true" : "false") + "}");
@@ -172,8 +428,7 @@ void handleApiPump() {
 
 // Endpoint điều khiển bơm thủ công từ điện thoại
 void handlePump() {
-    pumpRunning = !pumpRunning;
-    digitalWrite(PUMP_PIN, pumpRunning ? PUMP_ON : PUMP_OFF);
+    setPumpState(!pumpRunning, "WEB");
     Serial.printf("[WEB] Bơm được %s thủ công\n", pumpRunning ? "BẬT" : "TẮT");
     server.sendHeader("Location", "/");
     server.send(303);
@@ -218,6 +473,8 @@ void pushToFirebase(int avg, bool pump) {
         Serial.printf("[Firebase] ❌ Lỗi: %s\n", http.errorToString(code).c_str());
     }
     http.end();
+
+    pushMonthlyStatsIfNeeded(false);
 }
 
 // ─── FIREBASE: NHẬN LỆNH BƠM TỪ APP ───────────────────────────
@@ -236,8 +493,7 @@ void checkPumpCommand() {
         // Payload = {"state":"on"} hoặc {"state":"off"} hoặc null
         if (payload != "null" && payload.indexOf("state") >= 0) {
             bool newState = (payload.indexOf("\"on\"") >= 0);
-            pumpRunning = newState;
-            digitalWrite(PUMP_PIN, pumpRunning ? PUMP_ON : PUMP_OFF);
+            setPumpState(newState, "FirebaseCmd");
             Serial.printf("[Firebase] 📱 Lệnh bơm từ app: %s (payload=%s)\n", pumpRunning ? "BẬT" : "TẮT", payload.c_str());
             // Xóa lệnh sau khi thực hiện
             http.end();
@@ -264,7 +520,7 @@ void setup() {
     dht.begin();                         // Khởi động cảm biến không khí
 
     Serial.println("============================================");
-    Serial.println("  greenie-auto | 2 Cảm biến + Máy bơm");
+    Serial.println("  greenie-auto | Tối đa 6 cảm biến + Máy bơm");
     Serial.println("  Cảm biến: Capacitive Soil Moisture v1.2");
     Serial.println("  Board   : ESP32 Dev Module");
     Serial.println("============================================\n");
@@ -308,6 +564,7 @@ void setup() {
     server.on("/api/pump",  HTTP_GET,  handleApiPump);
 
     WiFi.mode(WIFI_AP_STA);
+    WiFi.setSleep(true);
     WiFi.setHostname("greenie-auto");
     WiFiManager wm;
     wm.setConfigPortalTimeout(180);   // Tự thoát portal sau 3 phút nếu không cài
@@ -335,12 +592,16 @@ void setup() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
+        WiFi.softAPdisconnect(true);
+        WiFi.mode(WIFI_STA);
+        syncTimeIfNeeded();
         if (MDNS.begin("greenie-auto")) {
             MDNS.addService("http", "tcp", 80);
             Serial.println("[mDNS] ✅ greenie-auto.local đã sẵn sàng");
         } else {
             Serial.println("[mDNS] ❌ Không khởi tạo được mDNS");
         }
+        Serial.println("[WiFi] Đã tắt AP, chạy STA + WiFi sleep để tiết kiệm pin.");
     }
 
     // Chỉ mở web server sau khi WiFiManager đã xử lý xong, tránh xung đột TCP/IP.
@@ -353,8 +614,6 @@ void setup() {
 
 // ─── LOOP ────────────────────────────────────────────────────────
 void loop() {
-    delay(READ_INTERVAL_MS);
-
     server.handleClient();   // Xử lý request từ điện thoại
 
     // Kiểm tra nút reset WiFi sau khi ESP32 đã khởi động
@@ -376,6 +635,23 @@ void loop() {
         resetRequested = false;
     }
 
+    unsigned long now = millis();
+
+    if (now - lastPumpPollMs >= PUMP_COMMAND_POLL_INTERVAL_MS) {
+        lastPumpPollMs = now;
+        checkPumpCommand();
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        syncTimeIfNeeded();
+    }
+
+    if (lastReadMs != 0 && now - lastReadMs < READ_INTERVAL_MS) {
+        delay(LOOP_IDLE_MS);
+        return;
+    }
+    lastReadMs = now;
+
     // Đọc cảm biến không khí DHT22
     float t = dht.readTemperature();
     float h = dht.readHumidity();
@@ -385,6 +661,12 @@ void loop() {
         Serial.println("[Không khí] Không cắm cảm biến");
     else
         Serial.printf("[Không khí] Nhiệt độ: %.1f°C  Độ ẩm: %.1f%%\n", lastAirTemp, lastAirHumidity);
+
+    ensureStatsDay();
+    if (lastAirTemp >= 0 && statsDayKey.length() > 0) {
+        statsTempSumX10 += (long)(lastAirTemp * 10.0f);
+        statsTempSamples++;
+    }
 
     // Đọc cảm biến theo SENSOR_COUNT
     int values[MAX_SENSORS] = {0};
@@ -398,9 +680,16 @@ void loop() {
     int avgPct = activeCount > 0 ? sum / activeCount : 0;
     lastAvg = avgPct;   // Lưu cho web
 
-    // Đẩy lên Firebase & kiểm tra lệnh điều khiển từ app
-    pushToFirebase(avgPct, pumpRunning);
-    checkPumpCommand();
+    if (activeCount > 0 && statsDayKey.length() > 0) {
+        statsSoilSum += avgPct;
+        statsSoilSamples++;
+    }
+
+    // Đẩy Firebase thưa hơn để tiết kiệm pin
+    if (lastFirebasePushMs == 0 || now - lastFirebasePushMs >= FIREBASE_PUSH_INTERVAL_MS) {
+        pushToFirebase(avgPct, pumpRunning);
+        lastFirebasePushMs = now;
+    }
 
     for (int i = 0; i < SENSOR_COUNT; i++) {
         if (lastSensorValues[i] < 0) {
@@ -419,16 +708,15 @@ void loop() {
 
     // ─── LOGIC ĐIỀU KHIỂN MÁY BƠM ────────────────────────────
     if (!pumpRunning && avgPct < PUMP_ON_THRESHOLD) {
-        digitalWrite(PUMP_PIN, PUMP_ON);
-        pumpRunning = true;
+        setPumpState(true, "Auto");
         Serial.printf("[MÁY BƠM]   ✅ BẬT  — TB %d%% < %d%%\n", avgPct, PUMP_ON_THRESHOLD);
     } else if (pumpRunning && avgPct >= PUMP_OFF_THRESHOLD) {
-        digitalWrite(PUMP_PIN, PUMP_OFF);
-        pumpRunning = false;
+        setPumpState(false, "Auto");
         Serial.printf("[MÁY BƠM]   ⛔ TẮT  — TB %d%% ≥ %d%%\n", avgPct, PUMP_OFF_THRESHOLD);
     } else {
         Serial.printf("[MÁY BƠM]   %s\n", pumpRunning ? "⚙️  ĐANG CHẠY" : "⏸  ĐỨNG");
     }
 
     Serial.println("--------------------------------------------");
+    delay(LOOP_IDLE_MS);
 }
