@@ -8,6 +8,7 @@ import kotlin.random.Random
 class MockSoilRepository : SoilRepository() {
     private var mockPumpRunning = false
     private var mockActiveSensors = 1
+    private var mockSchedule = WaterSchedule(enabled = true, durationMin = 2, timesCsv = "06:30,18:00", weekdaysCsv = "1,2,3,4,5,6,7")
     // Giả lập tối đa 6 khe cảm biến, -1 = không cắm
     // Mặc định chỉ cắm 1 cảm biến để test đúng logic ẩn/hiện trên app
     private val mockSensors = mutableListOf(45, -1, -1, -1, -1, -1)
@@ -69,6 +70,18 @@ class MockSoilRepository : SoilRepository() {
     override suspend fun setPump(on: Boolean): Result<Unit> = runCatching {
         mockPumpRunning = on
         logInfo("MockSoilRepository", "Đặt bơm thành: ${if (on) "BẬT" else "TẮT"}")
+    }
+
+    override suspend fun fetchWaterSchedule(): Result<WaterSchedule> = runCatching {
+        mockSchedule
+    }
+
+    override suspend fun setWaterSchedule(schedule: WaterSchedule): Result<Unit> = runCatching {
+        mockSchedule = schedule.copy(
+            durationMin = schedule.durationMin.coerceIn(1, 60),
+            timesCsv = schedule.timesCsv.ifBlank { "06:00" },
+            weekdaysCsv = schedule.weekdaysCsv.ifBlank { "1,2,3,4,5,6,7" }
+        )
     }
 
     override suspend fun fetchMonthlyStats(): Result<MonthlyStats> = runCatching {

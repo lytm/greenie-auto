@@ -2,6 +2,7 @@ package com.greenie.auto.shared
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -9,11 +10,16 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.CoroutineScope
@@ -217,14 +223,40 @@ private fun DashboardScreen(repository: SoilRepository, isMock: Boolean) {
     var monthlyError by remember { mutableStateOf<String?>(null) }
     var showMonthlyGrid by remember { mutableStateOf(false) }
     var showPumpHistory by remember { mutableStateOf(false) }
+    var showScheduleSettings by remember { mutableStateOf(false) }
+    var showAlertSettings by remember { mutableStateOf(false) }
+    var menuExpanded by remember { mutableStateOf(false) }
     var pumpHistory by remember { mutableStateOf(PumpHistory(entries = emptyList())) }
     var lowSoilAlert by remember { mutableStateOf(20) }
     var highTempAlert by remember { mutableStateOf(35f) }
+    var waterSchedule by remember { mutableStateOf(WaterSchedule()) }
+    var scheduleSaving by remember { mutableStateOf(false) }
+    var scheduleMessage by remember { mutableStateOf<String?>(null) }
+    var scheduleDirty by remember { mutableStateOf(false) }
     var mockSensorCount by remember { mutableStateOf((repository as? MockSoilRepository)?.getMockActiveSensors() ?: 1) }
     var loading by remember { mutableStateOf(true) }
     var sourceLabel by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
     val uriHandler = LocalUriHandler.current
+
+    fun openPanel(panel: String) {
+        showMonthlyGrid = false
+        showPumpHistory = false
+        showScheduleSettings = false
+        showAlertSettings = false
+        if (panel != "schedule") {
+            scheduleDirty = false
+        }
+        when (panel) {
+            "monthly" -> showMonthlyGrid = true
+            "history" -> showPumpHistory = true
+            "schedule" -> {
+                scheduleDirty = false
+                showScheduleSettings = true
+            }
+            "alert" -> showAlertSettings = true
+        }
+    }
 
     fun applyFetchResult(result: Result<SoilData>) {
         result
@@ -292,6 +324,28 @@ private fun DashboardScreen(repository: SoilRepository, isMock: Boolean) {
             delay(30_000L)
         }
     }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            repository.fetchWaterSchedule()
+                .onSuccess {
+                    if (!showScheduleSettings || !scheduleDirty) {
+                        waterSchedule = it
+                        scheduleDirty = false
+                    }
+                    if (scheduleMessage == null) {
+                        scheduleMessage = "Đã tải lịch tưới"
+                    }
+                }
+                .onFailure {
+                    logError("SoilRepository", "waterSchedule: ${it.message}")
+                    if (scheduleMessage == null) {
+                        scheduleMessage = "Chưa tải được lịch tưới"
+                    }
+                }
+            delay(30_000L)
+        }
+    }
     
     MaterialTheme(colorScheme = darkColorScheme()) {
         Scaffold(
@@ -306,7 +360,47 @@ private fun DashboardScreen(repository: SoilRepository, isMock: Boolean) {
                     colors = TopAppBarDefaults.topAppBarColors(
                         containerColor = AppBg,
                         titleContentColor = AppAccent
-                    )
+                    ),
+                    actions = {
+                        Box {
+                            IconButton(onClick = { menuExpanded = true }) {
+                                Text("⋮", color = AppTextPrimary, fontSize = 20.sp)
+                            }
+                            DropdownMenu(
+                                expanded = menuExpanded,
+                                onDismissRequest = { menuExpanded = false },
+                            ) {
+                                DropdownMenuItem(
+                                    text = { Text("📈 Biểu đồ tháng") },
+                                    onClick = {
+                                        menuExpanded = false
+                                        openPanel("monthly")
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("📋 Lịch sử tưới") },
+                                    onClick = {
+                                        menuExpanded = false
+                                        openPanel("history")
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("⏰ Lịch tưới tự động") },
+                                    onClick = {
+                                        menuExpanded = false
+                                        openPanel("schedule")
+                                    }
+                                )
+                                DropdownMenuItem(
+                                    text = { Text("🔔 Cảnh báo ngưỡng") },
+                                    onClick = {
+                                        menuExpanded = false
+                                        openPanel("alert")
+                                    }
+                                )
+                            }
+                        }
+                    }
                 )
             },
             containerColor = AppBg
@@ -318,6 +412,52 @@ private fun DashboardScreen(repository: SoilRepository, isMock: Boolean) {
                     .padding(innerPadding)
                     .padding(16.dp)
             ) {
+                if (showScheduleSettings) {
+                    ScheduleSettingsScreen(
+                        schedule = waterSchedule,
+                        runningNow = soilData?.scheduleRunning == true,
+                        saving = scheduleSaving,
+                        message = scheduleMessage,
+                        onChange = {
+                            waterSchedule = it
+                            scheduleDirty = true
+                        },
+                        onSave = { scheduleToSave ->
+                            scheduleSaving = true
+                            scheduleMessage = null
+                            val normalized = normalizeScheduleForSave(scheduleToSave)
+                            scope.launch {
+                                repository.setWaterSchedule(normalized)
+                                    .onSuccess {
+                                        scheduleSaving = false
+                                        scheduleDirty = false
+                                        waterSchedule = normalized
+                                        scheduleMessage = "✅ Đã lưu lịch: ${normalized.timesCsv.ifBlank { "06:00" }} • ${normalized.durationMin} phút"
+                                    }
+                                    .onFailure { err ->
+                                        scheduleSaving = false
+                                        val msg = err.message ?: "Không lưu được lịch tưới"
+                                        scheduleMessage = "❌ $msg"
+                                        warning = toUserFacingMessage(msg, hasCachedData = true)
+                                    }
+                            }
+                        },
+                        onBack = { showScheduleSettings = false }
+                    )
+                    return@Box
+                }
+
+                if (showAlertSettings) {
+                    AlertSettingsScreen(
+                        lowSoilAlert = lowSoilAlert,
+                        highTempAlert = highTempAlert,
+                        onLowSoilChange = { lowSoilAlert = it },
+                        onHighTempChange = { highTempAlert = it },
+                        onBack = { showAlertSettings = false }
+                    )
+                    return@Box
+                }
+
                 if (showPumpHistory) {
                     PumpHistoryScreen(
                         pumpHistory = pumpHistory,
@@ -378,17 +518,11 @@ private fun DashboardScreen(repository: SoilRepository, isMock: Boolean) {
 
                         SensorCards(
                             data = soilData!!,
-                            monthlyStats = monthlyStats,
-                            monthlyError = monthlyError,
-                            onOpenMonthlyGrid = { showMonthlyGrid = true },
-                            onOpenPumpHistory = { showPumpHistory = true },
                             lowSoilAlert = lowSoilAlert,
                             highTempAlert = highTempAlert,
-                            onLowSoilAlertChange = { lowSoilAlert = it },
-                            onHighTempAlertChange = { highTempAlert = it },
                             repository = repository,
                             scope = scope,
-                            onFailure = {
+                            onError = {
                                 warning = toUserFacingMessage(it, hasCachedData = true)
                             }
                         )
@@ -440,17 +574,11 @@ private fun MockSensorControlCard(count: Int, onChange: (Int) -> Unit) {
 @Composable
 private fun SensorCards(
     data: SoilData,
-    monthlyStats: MonthlyStats,
-    monthlyError: String?,
-    onOpenMonthlyGrid: () -> Unit,
-    onOpenPumpHistory: () -> Unit,
     lowSoilAlert: Int,
     highTempAlert: Float,
-    onLowSoilAlertChange: (Int) -> Unit,
-    onHighTempAlertChange: (Float) -> Unit,
     repository: SoilRepository,
     scope: CoroutineScope,
-    onFailure: (String) -> Unit,
+    onError: (String) -> Unit,
 ) {
     var pumpLoading by remember { mutableStateOf(false) }
 
@@ -491,12 +619,6 @@ private fun SensorCards(
         Spacer(Modifier.height(12.dp))
     }
 
-    MonthlyTrendPreviewCard(
-        monthlyStats = monthlyStats,
-        error = monthlyError,
-        onOpenMonthlyGrid = onOpenMonthlyGrid,
-    )
-    Spacer(Modifier.height(12.dp))
     PumpCard(
         isRunning = data.pump,
         loading = pumpLoading,
@@ -507,20 +629,92 @@ private fun SensorCards(
                     .onSuccess { pumpLoading = false }
                     .onFailure {
                         pumpLoading = false
-                        onFailure(it.message ?: "Không gửi được lệnh bơm")
+                        onError(it.message ?: "Không gửi được lệnh bơm")
                         logError("SoilRepository", it.message)
                     }
             }
         }
     )
-    Spacer(Modifier.height(12.dp))
-    AlertSettingsCard(
-        lowSoilAlert = lowSoilAlert,
-        highTempAlert = highTempAlert,
-        onLowSoilChange = onLowSoilAlertChange,
-        onHighTempChange = onHighTempAlertChange,
-        onOpenPumpHistory = onOpenPumpHistory,
-    )
+}
+
+@Composable
+private fun ScheduleSettingsScreen(
+    schedule: WaterSchedule,
+    runningNow: Boolean,
+    saving: Boolean,
+    message: String?,
+    onChange: (WaterSchedule) -> Unit,
+    onSave: (WaterSchedule) -> Unit,
+    onBack: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+    ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            OutlinedButton(onClick = onBack, shape = RoundedCornerShape(10.dp)) {
+                Text("← Quay lại")
+            }
+            Text(
+                "⏰ Lịch tưới tự động",
+                color = AppAccent,
+                fontWeight = FontWeight.Bold,
+                fontSize = 15.sp
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        AutoWaterScheduleCard(
+            schedule = schedule,
+            runningNow = runningNow,
+            saving = saving,
+            message = message,
+            onChange = onChange,
+            onSave = onSave,
+        )
+    }
+}
+
+@Composable
+private fun AlertSettingsScreen(
+    lowSoilAlert: Int,
+    highTempAlert: Float,
+    onLowSoilChange: (Int) -> Unit,
+    onHighTempChange: (Float) -> Unit,
+    onBack: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+    ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            OutlinedButton(onClick = onBack, shape = RoundedCornerShape(10.dp)) {
+                Text("← Quay lại")
+            }
+            Text(
+                "🔔 Cảnh báo ngưỡng",
+                color = AppAccent,
+                fontWeight = FontWeight.Bold,
+                fontSize = 15.sp
+            )
+        }
+        Spacer(Modifier.height(12.dp))
+        AlertSettingsCard(
+            lowSoilAlert = lowSoilAlert,
+            highTempAlert = highTempAlert,
+            onLowSoilChange = onLowSoilChange,
+            onHighTempChange = onHighTempChange,
+        )
+    }
 }
 
 @Composable
@@ -645,8 +839,19 @@ private fun MonthlyTrendGridScreen(
 
 @Composable
 private fun MonthlyLineChartCard(monthlyStats: MonthlyStats) {
-    val days = monthlyStats.days
-    val tempValues = days.map { it.avgTemp }
+    val allDays = monthlyStats.days
+    var selectedDays by remember { mutableStateOf(30) }
+    var panOffsetPx by remember { mutableStateOf(0f) }
+    var zoomScale by remember { mutableStateOf(1f) }
+    val textMeasurer = rememberTextMeasurer()
+
+    LaunchedEffect(selectedDays) {
+        panOffsetPx = 0f
+        zoomScale = 1f
+    }
+
+    val displayDays = allDays.takeLast(selectedDays.coerceAtMost(allDays.size.coerceAtLeast(1)))
+    val tempValues = displayDays.map { it.avgTemp }
     val minTempRaw = tempValues.minOrNull() ?: 0f
     val maxTempRaw = tempValues.maxOrNull() ?: 1f
     val minTemp = if (minTempRaw == maxTempRaw) minTempRaw - 1f else minTempRaw
@@ -659,84 +864,148 @@ private fun MonthlyLineChartCard(monthlyStats: MonthlyStats) {
         elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
     ) {
         Column(Modifier.padding(14.dp)) {
-            Text("Biểu đồ đường tháng", color = AppTextPrimary, fontWeight = FontWeight.Bold)
+            // Title + day-range selector
+            Row(
+                Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Text("📈 Biểu đồ đường", color = AppTextPrimary, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    listOf(7, 14, 30).forEach { n ->
+                        val isSelected = selectedDays == n
+                        Surface(
+                            onClick = { selectedDays = n },
+                            shape = RoundedCornerShape(6.dp),
+                            color = if (isSelected) AppAccent else AppTrack,
+                            modifier = Modifier.height(26.dp)
+                        ) {
+                            Box(
+                                contentAlignment = Alignment.Center,
+                                modifier = Modifier.padding(horizontal = 8.dp)
+                            ) {
+                                Text(
+                                    "${n}N",
+                                    color = if (isSelected) AppCard else AppTextSecondary,
+                                    fontSize = 11.sp,
+                                    fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
             Spacer(Modifier.height(6.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Text("🟧 Nhiệt độ", color = Color(0xFFE67E22), fontSize = 12.sp)
                 Text("🟦 Độ ẩm đất", color = Color(0xFF3498DB), fontSize = 12.sp)
             }
+            Spacer(Modifier.height(2.dp))
+            Text(
+                "Chụm/giãn để zoom • Kéo ngang để cuộn",
+                color = AppTextSecondary.copy(alpha = 0.6f),
+                fontSize = 10.sp
+            )
             Spacer(Modifier.height(8.dp))
 
             Canvas(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(190.dp)
+                    .height(210.dp)
+                    .clipToBounds()
+                    .pointerInput(Unit) {
+                        detectTransformGestures { _, pan, zoom, _ ->
+                            zoomScale = (zoomScale * zoom).coerceIn(1f, 5f)
+                            panOffsetPx += -pan.x
+                        }
+                    }
             ) {
-                val left = 10f
-                val right = size.width - 10f
-                val top = 12f
-                val bottom = size.height - 16f
+                val yLabelW = 38f
+                val left = yLabelW
+                val right = size.width - 8f
+                val top = 10f
+                val xLabelH = 28f
+                val bottom = size.height - xLabelH
                 val chartWidth = (right - left).coerceAtLeast(1f)
                 val chartHeight = (bottom - top).coerceAtLeast(1f)
-                val count = days.size
-                val stepX = if (count <= 1) 0f else chartWidth / (count - 1)
+                val count = displayDays.size
 
-                drawLine(
-                    color = AppTrack,
-                    start = Offset(left, bottom),
-                    end = Offset(right, bottom),
-                    strokeWidth = 2f
-                )
+                val totalW = chartWidth * zoomScale
+                val stepX = if (count <= 1) 0f else totalW / (count - 1).toFloat()
+                val maxPan = (totalW - chartWidth).coerceAtLeast(0f)
+                val pan = panOffsetPx.coerceIn(0f, maxPan)
 
-                for (i in 1..3) {
-                    val y = top + (chartHeight * i / 4f)
+                // Axes
+                drawLine(AppTrack, Offset(left, bottom), Offset(right, bottom), 2f)
+                drawLine(AppTrack, Offset(left, top), Offset(left, bottom), 2f)
+
+                // Horizontal grid lines + Y-axis temp labels
+                for (i in 0..4) {
+                    val y = bottom - chartHeight * i / 4f
                     drawLine(
-                        color = AppTrack.copy(alpha = 0.5f),
+                        color = AppTrack.copy(alpha = if (i == 0) 0f else 0.4f),
                         start = Offset(left, y),
                         end = Offset(right, y),
                         strokeWidth = 1f
                     )
+                    val tempVal = minTemp + (maxTemp - minTemp) * i / 4f
+                    val labelStr = "${(tempVal * 10).toInt() / 10.0}"
+                    drawText(
+                        textMeasurer = textMeasurer,
+                        text = labelStr,
+                        topLeft = Offset(0f, y - 7f),
+                        style = TextStyle(
+                            color = Color(0xFFE67E22).copy(alpha = 0.75f),
+                            fontSize = 8.5.sp
+                        )
+                    )
                 }
 
+                // Data lines + dots + X-axis labels
                 var prevTemp: Offset? = null
                 var prevSoil: Offset? = null
+                val labelStep = when {
+                    count <= 7 -> 1
+                    count <= 14 -> 2
+                    else -> 5
+                }
 
-                days.forEachIndexed { index, day ->
-                    val x = left + index * stepX
+                displayDays.forEachIndexed { index, day ->
+                    val x = left + index * stepX - pan
+
                     val tempRatio = ((day.avgTemp - minTemp) / (maxTemp - minTemp)).coerceIn(0f, 1f)
-                    val tempY = bottom - (tempRatio * chartHeight)
+                    val tempY = bottom - tempRatio * chartHeight
                     val tempPoint = Offset(x, tempY)
 
                     val soilPoint = if (day.avgSoil >= 0f) {
-                        val soilRatio = (day.avgSoil / 100f).coerceIn(0f, 1f)
-                        val soilY = bottom - (soilRatio * chartHeight)
+                        val soilY = bottom - (day.avgSoil / 100f).coerceIn(0f, 1f) * chartHeight
                         Offset(x, soilY)
-                    } else {
-                        null
-                    }
+                    } else null
 
-                    prevTemp?.let {
-                        drawLine(
-                            color = Color(0xFFE67E22),
-                            start = it,
-                            end = tempPoint,
-                            strokeWidth = 3f
-                        )
-                    }
-                    if (soilPoint != null) {
-                        prevSoil?.let {
-                            drawLine(
-                                color = Color(0xFF3498DB),
-                                start = it,
-                                end = soilPoint,
-                                strokeWidth = 3f
+                    // Draw lines (canvas clips at bounds)
+                    prevTemp?.let { drawLine(Color(0xFFE67E22), it, tempPoint, 2.5f) }
+                    soilPoint?.let { sp -> prevSoil?.let { drawLine(Color(0xFF3498DB), it, sp, 2.5f) } }
+
+                    // Dots and labels only for visible area
+                    if (x >= left - 4f && x <= right + 4f) {
+                        drawCircle(Color(0xFFE67E22), radius = 4f, center = tempPoint)
+                        soilPoint?.let { drawCircle(Color(0xFF3498DB), radius = 4f, center = it) }
+
+                        if (index % labelStep == 0 && x >= left) {
+                            val dayLabel = day.day.trimStart('0').ifEmpty { "0" }
+                            val monthPart = monthlyStats.monthKey.substringAfter('-').takeIf { it.isNotEmpty() }
+                            val label = if (monthPart != null) "$dayLabel/$monthPart" else dayLabel
+                            drawText(
+                                textMeasurer = textMeasurer,
+                                text = label,
+                                topLeft = Offset(x - 10f, bottom + 5f),
+                                style = TextStyle(
+                                    color = AppTextSecondary,
+                                    fontSize = 8.5.sp
+                                )
                             )
                         }
-                    }
-
-                    drawCircle(Color(0xFFE67E22), radius = 3.5f, center = tempPoint)
-                    soilPoint?.let {
-                        drawCircle(Color(0xFF3498DB), radius = 3.5f, center = it)
                     }
 
                     prevTemp = tempPoint
@@ -744,11 +1013,12 @@ private fun MonthlyLineChartCard(monthlyStats: MonthlyStats) {
                 }
             }
 
-            Spacer(Modifier.height(6.dp))
+            Spacer(Modifier.height(4.dp))
+            val monthLabel = monthlyStats.monthKey.ifBlank { "N/A" }
             Text(
-                "Nhiệt độ scale theo min-max tháng (${(minTemp * 10).toInt() / 10.0}°C → ${(maxTemp * 10).toInt() / 10.0}°C), độ ẩm đất scale 0-100%.",
+                "$monthLabel • ${displayDays.size}/${allDays.size} ngày • Nhiệt: ${(minTemp * 10).toInt() / 10.0}–${(maxTemp * 10).toInt() / 10.0}°C",
                 color = AppTextSecondary,
-                fontSize = 11.sp
+                fontSize = 10.sp
             )
         }
     }
@@ -1043,12 +1313,277 @@ private fun AlertBanner(message: String) {
 }
 
 @Composable
+private fun AutoWaterScheduleCard(
+    schedule: WaterSchedule,
+    runningNow: Boolean,
+    saving: Boolean,
+    message: String?,
+    onChange: (WaterSchedule) -> Unit,
+    onSave: (WaterSchedule) -> Unit,
+) {
+    Card(
+        Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = AppCard),
+        elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+    ) {
+        val slotList = parseTimesCsv(schedule.timesCsv)
+        val weekdays = parseWeekdaysCsv(schedule.weekdaysCsv)
+
+        Column(Modifier.padding(20.dp)) {
+            Text("⏰ Lịch tưới tự động", color = AppTextSecondary, fontSize = 14.sp)
+            Spacer(Modifier.height(10.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    if (schedule.enabled) "Đang bật" else "Đang tắt",
+                    color = if (schedule.enabled) Color(0xFF27AE60) else AppTextSecondary,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Switch(
+                    checked = schedule.enabled,
+                    onCheckedChange = { onChange(schedule.copy(enabled = it)) }
+                )
+            }
+
+            if (runningNow) {
+                Spacer(Modifier.height(8.dp))
+                Text("🚿 Đang tưới theo lịch", color = AppAccent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+            }
+
+            Spacer(Modifier.height(8.dp))
+            Text("Ngày chạy (T2..CN)", color = AppTextPrimary, fontSize = 13.sp)
+            Spacer(Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                val labels = listOf("T2", "T3", "T4", "T5", "T6", "T7", "CN")
+                for (idx in labels.indices) {
+                    val day = idx + 1
+                    val selected = weekdays.contains(day)
+                    OutlinedButton(
+                        onClick = {
+                            val next = weekdays.toMutableSet()
+                            if (selected) next.remove(day) else next.add(day)
+                            onChange(schedule.copy(weekdaysCsv = toWeekdaysCsv(next)))
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(34.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = if (selected) Color(0xFF244C3A) else Color.Transparent,
+                            contentColor = if (selected) AppAccent else AppTextSecondary,
+                        )
+                    ) {
+                        Text(labels[idx], fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(10.dp))
+            Text("Mốc giờ tưới (${slotList.size})", color = AppTextPrimary, fontSize = 13.sp)
+            Spacer(Modifier.height(6.dp))
+            slotList.forEachIndexed { index, slot ->
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(10.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF101A35))
+                ) {
+                    Column(Modifier.padding(10.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("Mốc ${index + 1}: ${formatTimeSlot(slot)}", color = AppTextPrimary, fontWeight = FontWeight.SemiBold)
+                            if (slotList.size > 1) {
+                                OutlinedButton(
+                                    onClick = {
+                                        val next = slotList.toMutableList().apply { removeAt(index) }
+                                        onChange(schedule.copy(timesCsv = toTimesCsv(next)))
+                                    },
+                                    modifier = Modifier.height(32.dp),
+                                    shape = RoundedCornerShape(8.dp)
+                                ) {
+                                    Text("Xóa", fontSize = 11.sp)
+                                }
+                            }
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    val next = slotList.toMutableList()
+                                    next[index] = next[index].copy(hour = (next[index].hour + 23) % 24)
+                                    onChange(schedule.copy(timesCsv = toTimesCsv(next)))
+                                },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(34.dp),
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp)
+                            ) { Text("-1h", fontSize = 11.sp, fontWeight = FontWeight.SemiBold) }
+                            OutlinedButton(
+                                onClick = {
+                                    val next = slotList.toMutableList()
+                                    next[index] = next[index].copy(hour = (next[index].hour + 1) % 24)
+                                    onChange(schedule.copy(timesCsv = toTimesCsv(next)))
+                                },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(34.dp),
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp)
+                            ) { Text("+1h", fontSize = 11.sp, fontWeight = FontWeight.SemiBold) }
+                            OutlinedButton(
+                                onClick = {
+                                    val next = slotList.toMutableList()
+                                    val mins = (next[index].hour * 60 + next[index].minute + 24 * 60 - 10) % (24 * 60)
+                                    next[index] = TimeSlot(hour = mins / 60, minute = mins % 60)
+                                    onChange(schedule.copy(timesCsv = toTimesCsv(next)))
+                                },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(34.dp),
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp)
+                            ) { Text("-10p", fontSize = 11.sp, fontWeight = FontWeight.SemiBold) }
+                            OutlinedButton(
+                                onClick = {
+                                    val next = slotList.toMutableList()
+                                    val mins = (next[index].hour * 60 + next[index].minute + 10) % (24 * 60)
+                                    next[index] = TimeSlot(hour = mins / 60, minute = mins % 60)
+                                    onChange(schedule.copy(timesCsv = toTimesCsv(next)))
+                                },
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(34.dp),
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp)
+                            ) { Text("+10p", fontSize = 11.sp, fontWeight = FontWeight.SemiBold) }
+                        }
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+            }
+
+            OutlinedButton(
+                onClick = {
+                    val next = slotList.toMutableList()
+                    if (next.size < 8) {
+                        val base = next.lastOrNull() ?: TimeSlot(6, 0)
+                        val mins = (base.hour * 60 + base.minute + 60) % (24 * 60)
+                        next.add(TimeSlot(mins / 60, mins % 60))
+                        onChange(schedule.copy(timesCsv = toTimesCsv(next)))
+                    }
+                },
+                enabled = slotList.size < 8,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Text(if (slotList.isEmpty()) "+ Thêm mốc giờ đầu tiên" else "+ Thêm mốc giờ", fontSize = 12.sp)
+            }
+
+            Spacer(Modifier.height(4.dp))
+            Text("Thời gian tưới: ${schedule.durationMin} phút", color = AppTextPrimary, fontSize = 13.sp)
+            Slider(
+                value = schedule.durationMin.toFloat(),
+                onValueChange = { onChange(schedule.copy(durationMin = it.toInt().coerceIn(1, 60))) },
+                valueRange = 1f..60f,
+                steps = 59,
+            )
+
+            Spacer(Modifier.height(8.dp))
+            Button(
+                onClick = { onSave(normalizeScheduleForSave(schedule)) },
+                enabled = !saving,
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                if (saving) {
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), color = Color.White)
+                } else {
+                    Text("Lưu lịch tưới", fontWeight = FontWeight.Bold)
+                }
+            }
+
+            message?.let {
+                Spacer(Modifier.height(8.dp))
+                Text(it, color = if (it.startsWith("✅")) Color(0xFF2ECC71) else AppTextSecondary, fontSize = 12.sp)
+            }
+        }
+    }
+}
+
+private data class TimeSlot(val hour: Int, val minute: Int)
+
+private fun parseTimesCsv(csv: String): List<TimeSlot> {
+    val parsed = csv
+        .split(',')
+        .mapNotNull { token ->
+            val clean = token.trim()
+            if (!clean.contains(':')) return@mapNotNull null
+            val hh = clean.substringBefore(':').toIntOrNull() ?: return@mapNotNull null
+            val mm = clean.substringAfter(':').toIntOrNull() ?: return@mapNotNull null
+            if (hh !in 0..23 || mm !in 0..59) return@mapNotNull null
+            TimeSlot(hh, mm)
+        }
+        .distinctBy { it.hour * 60 + it.minute }
+        .sortedBy { it.hour * 60 + it.minute }
+
+    return parsed
+}
+
+private fun toTimesCsv(slots: List<TimeSlot>): String =
+    slots
+        .distinctBy { it.hour * 60 + it.minute }
+        .sortedBy { it.hour * 60 + it.minute }
+        .joinToString(",") { formatTimeSlot(it) }
+
+private fun formatTimeSlot(slot: TimeSlot): String =
+    "${slot.hour.toString().padStart(2, '0')}:${slot.minute.toString().padStart(2, '0')}"
+
+private fun parseWeekdaysCsv(csv: String): Set<Int> {
+    val set = csv
+        .split(',')
+        .mapNotNull { it.trim().toIntOrNull() }
+        .filter { it in 1..7 }
+        .toSet()
+    return if (set.isEmpty()) (1..7).toSet() else set
+}
+
+private fun toWeekdaysCsv(days: Set<Int>): String {
+    val normalized = days.filter { it in 1..7 }.sorted()
+    return if (normalized.isEmpty()) "1,2,3,4,5,6,7" else normalized.joinToString(",")
+}
+
+private fun normalizeScheduleForSave(schedule: WaterSchedule): WaterSchedule {
+    val slots = parseTimesCsv(schedule.timesCsv)
+    val safeTimes = if (slots.isEmpty()) "06:00" else toTimesCsv(slots)
+    val safeDays = toWeekdaysCsv(parseWeekdaysCsv(schedule.weekdaysCsv))
+    return schedule.copy(
+        durationMin = schedule.durationMin.coerceIn(1, 60),
+        timesCsv = safeTimes,
+        weekdaysCsv = safeDays,
+    )
+}
+
+@Composable
 private fun AlertSettingsCard(
     lowSoilAlert: Int,
     highTempAlert: Float,
     onLowSoilChange: (Int) -> Unit,
     onHighTempChange: (Float) -> Unit,
-    onOpenPumpHistory: () -> Unit,
 ) {
     var expanded by remember { mutableStateOf(false) }
     Card(
@@ -1058,23 +1593,15 @@ private fun AlertSettingsCard(
         elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
     ) {
         Column(Modifier.padding(20.dp)) {
-            Text("🔔 Cảnh báo & Lịch sử", color = AppTextSecondary, fontSize = 14.sp)
+            Text("🔔 Cảnh báo ngưỡng", color = AppTextSecondary, fontSize = 14.sp)
 
             Spacer(Modifier.height(10.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.End
             ) {
                 OutlinedButton(
-                    onClick = onOpenPumpHistory,
-                    modifier = Modifier.weight(1f),
-                    shape = RoundedCornerShape(10.dp)
-                ) {
-                    Text("📋 Lịch sử tưới", fontSize = 12.sp)
-                }
-                OutlinedButton(
                     onClick = { expanded = !expanded },
-                    modifier = Modifier.weight(1f),
                     shape = RoundedCornerShape(10.dp)
                 ) {
                     Text(if (expanded) "Thu gọn" else "⚙️ Sửa", fontSize = 12.sp)

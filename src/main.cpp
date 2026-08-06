@@ -39,6 +39,7 @@ DHT dht(DHT_PIN, DHT_TYPE);
 #define READ_INTERVAL_MS               10000
 #define FIREBASE_PUSH_INTERVAL_MS      30000
 #define PUMP_COMMAND_POLL_INTERVAL_MS  10000
+#define SCHEDULE_SYNC_INTERVAL_MS       60000
 #define MONTHLY_STATS_PUSH_INTERVAL_MS 300000
 #define LOOP_IDLE_MS                      50
 #define SENSOR_SAMPLE_COUNT                5
@@ -120,8 +121,17 @@ unsigned long resetStartMs = 0;
 unsigned long lastReadMs = 0;
 unsigned long lastFirebasePushMs = 0;
 unsigned long lastPumpPollMs = 0;
+unsigned long lastScheduleSyncMs = 0;
 unsigned long lastTimeSyncAttemptMs = 0;
 unsigned long lastMonthlyStatsPushMs = 0;
+
+bool scheduleEnabled = false;
+int scheduleDurationMin = 2;
+String scheduleTimesCsv = "06:00";
+String scheduleWeekdaysCsv = "1,2,3,4,5,6,7";
+bool scheduleRunning = false;
+unsigned long scheduleRunUntilMs = 0;
+String lastScheduleRunKey = "";  // YYYY-MM-DD_HHMM
 
 String statsMonthKey = "";
 String statsDayKey = "";
@@ -350,6 +360,374 @@ void syncTimeIfNeeded() {
     Serial.println("[Time] Đang đồng bộ NTP...");
 }
 
+bool parseBoolArg(const String &raw, bool fallback) {
+    String value = raw;
+    value.toLowerCase();
+    if (value == "1" || value == "true" || value == "on" || value == "yes") return true;
+    if (value == "0" || value == "false" || value == "off" || value == "no") return false;
+    return fallback;
+}
+
+int parseJsonIntField(const String &payload, const char* key, int fallback) {
+    String token = String("\"") + key + "\":";
+    int idx = payload.indexOf(token);
+    if (idx < 0) return fallback;
+    idx += token.length();
+    while (idx < payload.length() && (payload[idx] == ' ' || payload[idx] == '\t')) idx++;
+    bool negative = false;
+    if (idx < payload.length() && payload[idx] == '-') {
+        negative = true;
+        idx++;
+    }
+
+    int value = 0;
+    bool hasDigit = false;
+    while (idx < payload.length() && isDigit(payload[idx])) {
+        value = value * 10 + (payload[idx] - '0');
+        idx++;
+        hasDigit = true;
+    }
+
+    if (!hasDigit) return fallback;
+    return negative ? -value : value;
+}
+
+bool parseJsonBoolField(const String &payload, const char* key, bool fallback) {
+    String token = String("\"") + key + "\":";
+    int idx = payload.indexOf(token);
+    if (idx < 0) return fallback;
+    idx += token.length();
+    while (idx < payload.length() && (payload[idx] == ' ' || payload[idx] == '\t')) idx++;
+    if (payload.startsWith("true", idx)) return true;
+    if (payload.startsWith("false", idx)) return false;
+    return fallback;
+}
+
+String parseJsonStringField(const String &payload, const char* key, const String &fallback) {
+    String token = String("\"") + key + "\":\"";
+    int idx = payload.indexOf(token);
+    if (idx < 0) return fallback;
+    idx += token.length();
+    int end = payload.indexOf('"', idx);
+    if (end < 0) return fallback;
+    return payload.substring(idx, end);
+}
+
+void normalizeTimesCsv() {
+    String source = scheduleTimesCsv;
+    source.trim();
+    if (source.length() == 0) {
+        scheduleTimesCsv = "06:00";
+        return;
+    }
+
+    bool seen[24 * 60] = {false};
+    String out = "";
+    int start = 0;
+    while (start < source.length()) {
+        int comma = source.indexOf(',', start);
+        if (comma < 0) comma = source.length();
+        String token = source.substring(start, comma);
+        token.trim();
+
+        int sep = token.indexOf(':');
+        if (sep > 0) {
+            int hh = token.substring(0, sep).toInt();
+            int mm = token.substring(sep + 1).toInt();
+            if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+                int key = hh * 60 + mm;
+                if (!seen[key]) {
+                    seen[key] = true;
+                    char buf[6];
+                    snprintf(buf, sizeof(buf), "%02d:%02d", hh, mm);
+                    if (out.length() > 0) out += ",";
+                    out += String(buf);
+                }
+            }
+        }
+        start = comma + 1;
+    }
+
+    if (out.length() == 0) out = "06:00";
+    scheduleTimesCsv = out;
+}
+
+void normalizeWeekdaysCsv() {
+    String source = scheduleWeekdaysCsv;
+    source.trim();
+    if (source.length() == 0) {
+        scheduleWeekdaysCsv = "1,2,3,4,5,6,7";
+        return;
+    }
+
+    bool used[8] = {false};
+    String out = "";
+    int start = 0;
+    while (start < source.length()) {
+        int comma = source.indexOf(',', start);
+        if (comma < 0) comma = source.length();
+        String token = source.substring(start, comma);
+        token.trim();
+        int day = token.toInt();
+        if (day >= 1 && day <= 7 && !used[day]) {
+            used[day] = true;
+            if (out.length() > 0) out += ",";
+            out += String(day);
+        }
+        start = comma + 1;
+    }
+
+    if (out.length() == 0) out = "1,2,3,4,5,6,7";
+    scheduleWeekdaysCsv = out;
+}
+
+void clampSchedule() {
+    scheduleDurationMin = constrain(scheduleDurationMin, 1, 60);
+    normalizeTimesCsv();
+    normalizeWeekdaysCsv();
+}
+
+void getPrimaryScheduleTime(int &hourOut, int &minuteOut) {
+    hourOut = 6;
+    minuteOut = 0;
+    int comma = scheduleTimesCsv.indexOf(',');
+    String first = (comma < 0) ? scheduleTimesCsv : scheduleTimesCsv.substring(0, comma);
+    int sep = first.indexOf(':');
+    if (sep > 0) {
+        hourOut = constrain(first.substring(0, sep).toInt(), 0, 23);
+        minuteOut = constrain(first.substring(sep + 1).toInt(), 0, 59);
+    }
+}
+
+bool isWeekdayAllowed(int dayMonToSun) {
+    String token = String(dayMonToSun);
+    int start = 0;
+    while (start < scheduleWeekdaysCsv.length()) {
+        int comma = scheduleWeekdaysCsv.indexOf(',', start);
+        if (comma < 0) comma = scheduleWeekdaysCsv.length();
+        String part = scheduleWeekdaysCsv.substring(start, comma);
+        part.trim();
+        if (part == token) return true;
+        start = comma + 1;
+    }
+    return false;
+}
+
+bool isTimeSlotMatched(int hour, int minute) {
+    int start = 0;
+    while (start < scheduleTimesCsv.length()) {
+        int comma = scheduleTimesCsv.indexOf(',', start);
+        if (comma < 0) comma = scheduleTimesCsv.length();
+        String part = scheduleTimesCsv.substring(start, comma);
+        part.trim();
+        int sep = part.indexOf(':');
+        if (sep > 0) {
+            int hh = part.substring(0, sep).toInt();
+            int mm = part.substring(sep + 1).toInt();
+            if (hh == hour && mm == minute) return true;
+        }
+        start = comma + 1;
+    }
+    return false;
+}
+
+bool getCurrentDateYmd(String &dateYmd) {
+    time_t now;
+    time(&now);
+    struct tm tmNow;
+    if (!localtime_r(&now, &tmNow)) return false;
+    if (tmNow.tm_year + 1900 < 2024) return false;
+    char dateBuf[11];
+    strftime(dateBuf, sizeof(dateBuf), "%Y-%m-%d", &tmNow);
+    dateYmd = String(dateBuf);
+    return true;
+}
+
+void pushWateringScheduleToFirebase() {
+    if (WiFi.status() != WL_CONNECTED) return;
+    clampSchedule();
+
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    String url = String(FIREBASE_URL) + "/watering_schedule.json?auth=" + FIREBASE_SECRET;
+    http.begin(url);
+    http.addHeader("Content-Type", "application/json");
+    int firstHour = 6;
+    int firstMinute = 0;
+    getPrimaryScheduleTime(firstHour, firstMinute);
+    String body = "{";
+    body += String("\"enabled\":") + (scheduleEnabled ? "true" : "false") + ",";
+    body += String("\"hour\":") + String(firstHour) + ",";
+    body += String("\"minute\":") + String(firstMinute) + ",";
+    body += String("\"duration_min\":") + String(scheduleDurationMin) + ",";
+    body += String("\"times_csv\":\"") + scheduleTimesCsv + "\",";
+    body += String("\"weekdays_csv\":\"") + scheduleWeekdaysCsv + "\"";
+    body += "}";
+
+    int code = http.PUT(body);
+    if (code > 0) {
+        Serial.printf("[Firebase] ⏰ Lưu watering_schedule OK (HTTP %d)\n", code);
+    } else {
+        Serial.printf("[Firebase] ❌ Lưu watering_schedule lỗi: %s\n", http.errorToString(code).c_str());
+    }
+    http.end();
+}
+
+void syncWateringScheduleFromFirebase() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    HTTPClient http;
+    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.begin(String(FIREBASE_URL) + "/watering_schedule.json?auth=" + FIREBASE_SECRET);
+    int code = http.GET();
+    if (code == 200) {
+        String payload = http.getString();
+        if (payload != "null") {
+            scheduleEnabled = parseJsonBoolField(payload, "enabled", scheduleEnabled);
+            scheduleDurationMin = parseJsonIntField(payload, "duration_min", scheduleDurationMin);
+            String legacyTime = "";
+            int legacyHour = parseJsonIntField(payload, "hour", -1);
+            int legacyMinute = parseJsonIntField(payload, "minute", -1);
+            if (legacyHour >= 0 && legacyMinute >= 0) {
+                char legacyBuf[6];
+                snprintf(legacyBuf, sizeof(legacyBuf), "%02d:%02d", constrain(legacyHour, 0, 23), constrain(legacyMinute, 0, 59));
+                legacyTime = String(legacyBuf);
+            }
+            String parsedTimes = parseJsonStringField(payload, "times_csv", legacyTime);
+            if (parsedTimes.length() > 0) {
+                scheduleTimesCsv = parsedTimes;
+            }
+            String parsedWeekdays = parseJsonStringField(payload, "weekdays_csv", scheduleWeekdaysCsv);
+            if (parsedWeekdays.length() > 0) {
+                scheduleWeekdaysCsv = parsedWeekdays;
+            }
+            clampSchedule();
+        }
+    }
+    http.end();
+}
+
+class WebServer;
+extern WebServer server;
+
+void handleApiSchedule() {
+    bool changed = false;
+    if (server.hasArg("enabled")) {
+        scheduleEnabled = parseBoolArg(server.arg("enabled"), scheduleEnabled);
+        changed = true;
+    }
+    if (server.hasArg("hour")) {
+        int legacyHour = constrain(server.arg("hour").toInt(), 0, 23);
+        int firstHour = 6;
+        int firstMinute = 0;
+        getPrimaryScheduleTime(firstHour, firstMinute);
+        char firstBuf[6];
+        snprintf(firstBuf, sizeof(firstBuf), "%02d:%02d", legacyHour, firstMinute);
+        int comma = scheduleTimesCsv.indexOf(',');
+        if (comma >= 0) {
+            scheduleTimesCsv = String(firstBuf) + scheduleTimesCsv.substring(comma);
+        } else {
+            scheduleTimesCsv = String(firstBuf);
+        }
+        changed = true;
+    }
+    if (server.hasArg("minute")) {
+        int legacyMinute = constrain(server.arg("minute").toInt(), 0, 59);
+        int firstHour = 6;
+        int firstMinute = 0;
+        getPrimaryScheduleTime(firstHour, firstMinute);
+        char firstBuf[6];
+        snprintf(firstBuf, sizeof(firstBuf), "%02d:%02d", firstHour, legacyMinute);
+        int comma = scheduleTimesCsv.indexOf(',');
+        if (comma >= 0) {
+            scheduleTimesCsv = String(firstBuf) + scheduleTimesCsv.substring(comma);
+        } else {
+            scheduleTimesCsv = String(firstBuf);
+        }
+        changed = true;
+    }
+    if (server.hasArg("duration_min")) {
+        scheduleDurationMin = server.arg("duration_min").toInt();
+        changed = true;
+    }
+    if (server.hasArg("times_csv")) {
+        scheduleTimesCsv = server.arg("times_csv");
+        changed = true;
+    }
+    if (server.hasArg("weekdays_csv")) {
+        scheduleWeekdaysCsv = server.arg("weekdays_csv");
+        changed = true;
+    }
+
+    clampSchedule();
+    if (changed) {
+        pushWateringScheduleToFirebase();
+        Serial.printf("[Schedule] Cập nhật: enabled=%d times=%s days=%s duration=%d phút\n",
+                      scheduleEnabled ? 1 : 0, scheduleTimesCsv.c_str(), scheduleWeekdaysCsv.c_str(), scheduleDurationMin);
+    }
+
+    int firstHour = 6;
+    int firstMinute = 0;
+    getPrimaryScheduleTime(firstHour, firstMinute);
+
+    String json = "{";
+    json += String("\"enabled\":") + (scheduleEnabled ? "true" : "false") + ",";
+    json += String("\"hour\":") + String(firstHour) + ",";
+    json += String("\"minute\":") + String(firstMinute) + ",";
+    json += String("\"duration_min\":") + String(scheduleDurationMin) + ",";
+    json += String("\"times_csv\":\"") + scheduleTimesCsv + "\",";
+    json += String("\"weekdays_csv\":\"") + scheduleWeekdaysCsv + "\",";
+    json += String("\"running\":") + (scheduleRunning ? "true" : "false");
+    json += "}";
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "application/json", json);
+}
+
+void handleScheduledWatering() {
+    if (!scheduleEnabled) {
+        if (scheduleRunning && !pumpRunning) {
+            scheduleRunning = false;
+            scheduleRunUntilMs = 0;
+        }
+        return;
+    }
+
+    if (scheduleRunning) {
+        if (!pumpRunning || millis() >= scheduleRunUntilMs) {
+            scheduleRunning = false;
+            scheduleRunUntilMs = 0;
+            if (pumpRunning) {
+                setPumpState(false, "ScheduleEnd");
+            }
+        }
+        return;
+    }
+
+    time_t now;
+    time(&now);
+    struct tm tmNow;
+    if (!localtime_r(&now, &tmNow)) return;
+    if (tmNow.tm_year + 1900 < 2024) return;
+
+    String today;
+    if (!getCurrentDateYmd(today)) return;
+
+    int dayMonToSun = tmNow.tm_wday == 0 ? 7 : tmNow.tm_wday;
+    if (!isWeekdayAllowed(dayMonToSun)) return;
+    if (!isTimeSlotMatched(tmNow.tm_hour, tmNow.tm_min)) return;
+
+    char slotBuf[18];
+    snprintf(slotBuf, sizeof(slotBuf), "%s_%02d%02d", today.c_str(), tmNow.tm_hour, tmNow.tm_min);
+    String runKey = String(slotBuf);
+    if (lastScheduleRunKey == runKey) return;
+
+    lastScheduleRunKey = runKey;
+        scheduleRunning = true;
+        scheduleRunUntilMs = millis() + (unsigned long)scheduleDurationMin * 60UL * 1000UL;
+        setPumpState(true, "ScheduleStart");
+        Serial.printf("[Schedule] 🚿 Bắt đầu tưới tự động %02d:%02d trong %d phút\n", tmNow.tm_hour, tmNow.tm_min, scheduleDurationMin);
+}
+
 // ─── WEB SERVER ──────────────────────────────────────────────────
 WebServer server(80);
 String lastIpLog = "";
@@ -410,7 +788,17 @@ void handleApiData() {
     json += String("\"air_humidity\":") + String(lastAirHumidity, 1) + ",";
     json += String("\"pump\":") + String(pumpRunning ? "true" : "false") + ",";
     json += String("\"threshold_on\":") + String(PUMP_ON_THRESHOLD) + ",";
-    json += String("\"threshold_off\":") + String(PUMP_OFF_THRESHOLD);
+    json += String("\"threshold_off\":") + String(PUMP_OFF_THRESHOLD) + ",";
+    int firstHour = 6;
+    int firstMinute = 0;
+    getPrimaryScheduleTime(firstHour, firstMinute);
+    json += String("\"schedule_enabled\":") + String(scheduleEnabled ? "true" : "false") + ",";
+    json += String("\"schedule_hour\":") + String(firstHour) + ",";
+    json += String("\"schedule_minute\":") + String(firstMinute) + ",";
+    json += String("\"schedule_duration_min\":") + String(scheduleDurationMin) + ",";
+    json += String("\"schedule_times_csv\":\"") + scheduleTimesCsv + "\",";
+    json += String("\"schedule_weekdays_csv\":\"") + scheduleWeekdaysCsv + "\",";
+    json += String("\"schedule_running\":") + String(scheduleRunning ? "true" : "false");
     json += "}";
     server.sendHeader("Access-Control-Allow-Origin", "*");
     server.send(200, "application/json", json);
@@ -464,7 +852,17 @@ void pushToFirebase(int avg, bool pump) {
     body += "\"air_humidity\":" + String(lastAirHumidity, 1) + ",";
     body += "\"pump\":" + String(pump ? "true" : "false") + ",";
     body += "\"threshold_on\":" + String(PUMP_ON_THRESHOLD) + ",";
-    body += "\"threshold_off\":" + String(PUMP_OFF_THRESHOLD);
+    body += "\"threshold_off\":" + String(PUMP_OFF_THRESHOLD) + ",";
+    int firstHour = 6;
+    int firstMinute = 0;
+    getPrimaryScheduleTime(firstHour, firstMinute);
+    body += "\"schedule_enabled\":" + String(scheduleEnabled ? "true" : "false") + ",";
+    body += "\"schedule_hour\":" + String(firstHour) + ",";
+    body += "\"schedule_minute\":" + String(firstMinute) + ",";
+    body += "\"schedule_duration_min\":" + String(scheduleDurationMin) + ",";
+    body += "\"schedule_times_csv\":\"" + scheduleTimesCsv + "\",";
+    body += "\"schedule_weekdays_csv\":\"" + scheduleWeekdaysCsv + "\",";
+    body += "\"schedule_running\":" + String(scheduleRunning ? "true" : "false");
     body += "}";
     int code = http.PUT(body);
     if (code > 0) {
@@ -529,25 +927,7 @@ void setup() {
     // ─── KIỂM TRA NÚT RESET WIFI ─────────────────────────────────
     pinMode(RESET_PIN, INPUT_PULLUP);
     Serial.println("[Reset] Giữ nút BOOT trong 3 giây sau khi ESP32 đã khởi động để xóa WiFi đã lưu.");
-
-    // Nếu nút BOOT được giữ sau khi ESP đã khởi động,
-    // xóa cấu hình WiFi để bắt đầu lại với portal AP.
-    if (digitalRead(RESET_PIN) == LOW) {
-        Serial.println("[Reset] Nút BOOT đang giữ, bắt đầu đếm 3 giây...");
-        unsigned long pressedMs = millis();
-        while (digitalRead(RESET_PIN) == LOW && millis() - pressedMs < RESET_HOLD_MS) {
-            delay(50);
-        }
-        if (digitalRead(RESET_PIN) == LOW) {
-            Serial.println("[Reset] ✅ Đã giữ đủ 3 giây. Xóa WiFi và khởi động lại...");
-            WiFiManager wm;
-            wm.resetSettings();
-            WiFi.disconnect(true);
-            delay(500);
-            ESP.restart();
-        }
-        Serial.println("[Reset] Nút BOOT đã thả trước 3 giây, tiếp tục quá trình bình thường.");
-    }
+    Serial.println("[Reset] Bỏ qua reset WiFi ở giai đoạn boot để tránh xóa nhầm credentials.");
 
     // ─── KẾT NỐI WIFI QUA ĐIỆN THOẠI ─────────────────────────────
     // Lần đầu (hoặc chưa có thông tin WiFi):
@@ -562,8 +942,11 @@ void setup() {
     server.on("/pump",      HTTP_POST, handlePump);
     server.on("/api/data",  HTTP_GET,  handleApiData);
     server.on("/api/pump",  HTTP_GET,  handleApiPump);
+    server.on("/api/schedule", HTTP_GET, handleApiSchedule);
 
     WiFi.mode(WIFI_AP_STA);
+    WiFi.persistent(true);       // lưu credentials vào NVS để tắt nguồn vẫn còn
+    WiFi.setAutoReconnect(true); // tự reconnect khi WiFi tạm rớt
     WiFi.setSleep(true);
     WiFi.setHostname("greenie-auto");
     WiFiManager wm;
@@ -572,22 +955,14 @@ void setup() {
     Serial.println("[WiFi] Bắt đầu cấu hình WiFi.");
     Serial.printf("[WiFi] Hiện tại mode: %d, SSID lưu: %s\n", WiFi.getMode(), WiFi.SSID().c_str());
 
-    bool portalStarted = false;
-    if (WiFi.SSID().length() == 0) {
-        Serial.println("[WiFi] Chưa có cấu hình lưu. Mở portal cấu hình AP ngay.");
-        portalStarted = wm.startConfigPortal("greenie-auto-setup");
-    } else {
-        Serial.println("[WiFi] Đã có SSID lưu, thử autoConnect trước.");
-        if (!wm.autoConnect("greenie-auto-setup")) {
-            Serial.println("[WiFi] autoConnect thất bại. Bắt đầu portal cấu hình AP.");
-            portalStarted = wm.startConfigPortal("greenie-auto-setup");
-        } else {
-            portalStarted = true;
-        }
-    }
+    // Quan trọng: WiFi.SSID() có thể rỗng ở thời điểm boot dù credentials vẫn còn.
+    // Vì vậy luôn dùng autoConnect trước: nếu có credentials sẽ vào WiFi trực tiếp,
+    // nếu không có hoặc sai mật khẩu thì WiFiManager tự mở portal setup.
+    Serial.println("[WiFi] Thử autoConnect trước (tự fallback portal nếu cần)...");
+    bool connectedOrPortal = wm.autoConnect("greenie-auto-setup");
 
-    if (!portalStarted) {
-        Serial.println("[WiFi] Không thể mở portal AP. Khởi động lại...");
+    if (!connectedOrPortal) {
+        Serial.println("[WiFi] autoConnect/portal timeout hoặc thất bại. Khởi động lại...");
         ESP.restart();
     }
 
@@ -595,6 +970,7 @@ void setup() {
         WiFi.softAPdisconnect(true);
         WiFi.mode(WIFI_STA);
         syncTimeIfNeeded();
+        syncWateringScheduleFromFirebase();
         if (MDNS.begin("greenie-auto")) {
             MDNS.addService("http", "tcp", 80);
             Serial.println("[mDNS] ✅ greenie-auto.local đã sẵn sàng");
@@ -626,7 +1002,7 @@ void loop() {
             WiFiManager wm;
             wm.resetSettings();
             WiFi.disconnect(true);
-            Serial.println("[Reset] ✅ Đã xóa WiFi! Khởi động lại...");
+            Serial.println("[Reset] ✅ Đã xóa WiFi! Khởi động lại để vào flow setup (portal)...");
             delay(500);
             ESP.restart();
         }
@@ -640,6 +1016,11 @@ void loop() {
     if (now - lastPumpPollMs >= PUMP_COMMAND_POLL_INTERVAL_MS) {
         lastPumpPollMs = now;
         checkPumpCommand();
+    }
+
+    if (now - lastScheduleSyncMs >= SCHEDULE_SYNC_INTERVAL_MS) {
+        lastScheduleSyncMs = now;
+        syncWateringScheduleFromFirebase();
     }
 
     if (WiFi.status() == WL_CONNECTED) {
@@ -685,6 +1066,8 @@ void loop() {
         statsSoilSamples++;
     }
 
+    handleScheduledWatering();
+
     // Đẩy Firebase thưa hơn để tiết kiệm pin
     if (lastFirebasePushMs == 0 || now - lastFirebasePushMs >= FIREBASE_PUSH_INTERVAL_MS) {
         pushToFirebase(avgPct, pumpRunning);
@@ -707,7 +1090,9 @@ void loop() {
     }
 
     // ─── LOGIC ĐIỀU KHIỂN MÁY BƠM ────────────────────────────
-    if (!pumpRunning && avgPct < PUMP_ON_THRESHOLD) {
+    if (scheduleRunning) {
+        Serial.printf("[MÁY BƠM]   ⏱ Đang tưới theo lịch (%s, %d phút)\n", scheduleTimesCsv.c_str(), scheduleDurationMin);
+    } else if (!pumpRunning && avgPct < PUMP_ON_THRESHOLD) {
         setPumpState(true, "Auto");
         Serial.printf("[MÁY BƠM]   ✅ BẬT  — TB %d%% < %d%%\n", avgPct, PUMP_ON_THRESHOLD);
     } else if (pumpRunning && avgPct >= PUMP_OFF_THRESHOLD) {

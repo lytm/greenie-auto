@@ -16,6 +16,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.floatOrNull
 import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
@@ -65,6 +66,56 @@ class FirebaseSoilRepository(
             throw Exception("HTTP ${resp.status.value} ${resp.status.description}: $text")
         }
         logInfo("FirebaseSoilRepository", "Gửi lệnh bơm: $state ✅")
+        Unit
+    }
+
+    override suspend fun fetchWaterSchedule(): Result<WaterSchedule> = runCatching {
+        val resp: HttpResponse = client.get("$firebaseUrl/watering_schedule.json")
+        if (!resp.status.isSuccess()) {
+            val text = resp.bodyAsText()
+            throw Exception("HTTP ${resp.status.value} ${resp.status.description}: $text")
+        }
+        val body = resp.bodyAsText()
+        if (body == "null") return@runCatching WaterSchedule()
+
+        val obj = Json.parseToJsonElement(body).jsonObject
+        val legacyHour = obj.int("hour").coerceIn(0, 23)
+        val legacyMinute = obj.int("minute").coerceIn(0, 59)
+        val legacyTime = "${legacyHour.toString().padStart(2, '0')}:${legacyMinute.toString().padStart(2, '0')}"
+        WaterSchedule(
+            enabled = obj.bool("enabled"),
+            durationMin = obj.int("duration_min").coerceIn(1, 60),
+            timesCsv = obj.string("times_csv").ifBlank { legacyTime },
+            weekdaysCsv = obj.string("weekdays_csv").ifBlank { "1,2,3,4,5,6,7" },
+            running = obj.bool("running"),
+        )
+    }
+
+    override suspend fun setWaterSchedule(schedule: WaterSchedule): Result<Unit> = runCatching {
+        val firstTime = schedule.timesCsv
+            .split(',')
+            .map { it.trim() }
+            .firstOrNull { it.contains(':') }
+            ?: "06:00"
+        val hh = firstTime.substringBefore(':').toIntOrNull()?.coerceIn(0, 23) ?: 6
+        val mm = firstTime.substringAfter(':').toIntOrNull()?.coerceIn(0, 59) ?: 0
+
+        val body = "{" +
+            "\"enabled\":${if (schedule.enabled) "true" else "false"}," +
+            "\"hour\":$hh," +
+            "\"minute\":$mm," +
+            "\"duration_min\":${schedule.durationMin.coerceIn(1, 60)}," +
+            "\"times_csv\":\"${schedule.timesCsv}\"," +
+            "\"weekdays_csv\":\"${schedule.weekdaysCsv}\"" +
+            "}"
+
+        val resp: HttpResponse = client.put("$firebaseUrl/watering_schedule.json") {
+            setBody(body)
+        }
+        if (!resp.status.isSuccess()) {
+            val text = resp.bodyAsText()
+            throw Exception("HTTP ${resp.status.value} ${resp.status.description}: $text")
+        }
         Unit
     }
 
@@ -141,6 +192,16 @@ private fun JsonObject.number(key: String): Float {
 private fun JsonObject.int(key: String): Int {
     val primitive = this[key]?.jsonPrimitive as? JsonPrimitive ?: return 0
     return primitive.intOrNull ?: primitive.floatOrNull?.toInt() ?: 0
+}
+
+private fun JsonObject.bool(key: String): Boolean {
+    val primitive = this[key]?.jsonPrimitive as? JsonPrimitive ?: return false
+    return primitive.contentOrNull?.lowercase() == "true"
+}
+
+private fun JsonObject.string(key: String): String {
+    val primitive = this[key]?.jsonPrimitive as? JsonPrimitive ?: return ""
+    return primitive.contentOrNull ?: ""
 }
 
 private fun kotlinx.serialization.json.JsonElement.jsonObjectOrNull(): JsonObject? =

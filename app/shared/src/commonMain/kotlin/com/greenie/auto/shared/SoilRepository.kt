@@ -14,6 +14,12 @@ abstract class SoilRepository {
     abstract suspend fun fetchData(): Result<SoilData>
     abstract suspend fun setPump(on: Boolean): Result<Unit>
 
+    open suspend fun fetchWaterSchedule(): Result<WaterSchedule> =
+        Result.success(WaterSchedule())
+
+    open suspend fun setWaterSchedule(schedule: WaterSchedule): Result<Unit> =
+        Result.success(Unit)
+
     open suspend fun fetchMonthlyStats(): Result<MonthlyStats> =
         Result.success(MonthlyStats(monthKey = "", days = emptyList()))
 

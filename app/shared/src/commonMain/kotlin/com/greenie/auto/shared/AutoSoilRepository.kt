@@ -81,6 +81,30 @@ class LocalEsp32Repository : SoilRepository() {
         Unit
     }
 
+    override suspend fun fetchWaterSchedule(): Result<WaterSchedule> = attempt("GET /api/schedule") { baseUrl ->
+        val resp: HttpResponse = client.get("$baseUrl/api/schedule")
+        if (resp.status.isSuccess()) {
+            resp.body()
+        } else {
+            val text = resp.bodyAsText()
+            throw Exception("HTTP ${resp.status.value} ${resp.status.description}: $text")
+        }
+    }
+
+    override suspend fun setWaterSchedule(schedule: WaterSchedule): Result<Unit> = attempt("GET /api/schedule") { baseUrl ->
+        val resp: HttpResponse = client.get("$baseUrl/api/schedule") {
+            parameter("enabled", if (schedule.enabled) 1 else 0)
+            parameter("duration_min", schedule.durationMin.coerceIn(1, 60))
+            parameter("times_csv", schedule.timesCsv)
+            parameter("weekdays_csv", schedule.weekdaysCsv)
+        }
+        if (!resp.status.isSuccess()) {
+            val text = resp.bodyAsText()
+            throw Exception("HTTP ${resp.status.value} ${resp.status.description}: $text")
+        }
+        Unit
+    }
+
     private suspend fun <T> attempt(
         action: String,
         block: suspend (String) -> T,
@@ -183,6 +207,48 @@ class AutoSoilRepository(
         val message = lastError?.message ?: "Không gửi được lệnh bơm"
         lastFailureSummary = message
         return Result.failure(Exception(message))
+    }
+
+    override suspend fun fetchWaterSchedule(): Result<WaterSchedule> {
+        val localResult = localRepository.fetchWaterSchedule()
+        if (localResult.isSuccess) {
+            lastSuccessfulSource = ConnectionSource.LocalWifi
+            return localResult
+        }
+
+        val firebaseResult = firebaseRepository.fetchWaterSchedule()
+        if (firebaseResult.isSuccess) {
+            lastSuccessfulSource = ConnectionSource.Firebase
+            return firebaseResult
+        }
+
+        return Result.failure(
+            Exception(
+                localResult.exceptionOrNull()?.message
+                    ?: firebaseResult.exceptionOrNull()?.message
+                    ?: "Không đọc được lịch tưới"
+            )
+        )
+    }
+
+    override suspend fun setWaterSchedule(schedule: WaterSchedule): Result<Unit> {
+        val preferredOrder = when (lastSuccessfulSource) {
+            ConnectionSource.LocalWifi -> listOf(localRepository, firebaseRepository)
+            ConnectionSource.Firebase -> listOf(firebaseRepository, localRepository)
+            null -> listOf(localRepository, firebaseRepository)
+        }
+
+        var lastError: Throwable? = null
+        for (repository in preferredOrder) {
+            val result = repository.setWaterSchedule(schedule)
+            if (result.isSuccess) {
+                lastSuccessfulSource = if (repository === localRepository) ConnectionSource.LocalWifi else ConnectionSource.Firebase
+                return result
+            }
+            lastError = result.exceptionOrNull()
+        }
+
+        return Result.failure(Exception(lastError?.message ?: "Không lưu được lịch tưới"))
     }
 
     override suspend fun fetchMonthlyStats(): Result<MonthlyStats> {

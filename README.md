@@ -48,16 +48,28 @@ Lưu ý: chỉ dùng ADC1 (32/33/34/35/36/39) khi chạy WiFi.
 - Tính trung bình trên các cảm biến đất còn tín hiệu
 - Bật relay khi `average < PUMP_ON_THRESHOLD`
 - Tắt relay khi `average >= PUMP_OFF_THRESHOLD`
+- Hỗ trợ lịch tưới tự động theo giờ:
+  - Cấu hình tại app: bật/tắt, nhiều mốc giờ trong ngày, chọn thứ T2..CN, thời lượng tưới (phút)
+  - Firmware tự chạy theo từng mốc giờ hợp lệ trong các ngày đã chọn
 
 ### Đồng bộ dữ liệu
 - Local API: `/api/data`, `/api/pump`
 - Firebase Realtime DB: ghi vào `/sensor_data`, đọc lệnh từ `/pump_command`
+- Lịch sử tưới: firmware ghi vào `/pump_history/{YYYY-MM-DD}/{HHMMSS}` khi bơm tắt
+- Lịch tưới tự động: đọc/ghi ở `/watering_schedule`
 - Bản tối ưu pin hiện tại:
   - Đọc cảm biến mỗi khoảng 10 giây
   - Kiểm tra lệnh bơm mỗi khoảng 10 giây
   - Đẩy Firebase mỗi khoảng 30 giây
   - `monthly_stats` chỉ đẩy khi tới chu kỳ 5 phút, khi nhiệt độ/pump count đổi đáng kể, hoặc lúc sang ngày mới
   - Tắt AP sau khi đã vào WiFi và bật WiFi sleep
+
+### Flow WiFi sau khi mất nguồn / thay pin
+- ESP32 luôn thử `autoConnect("greenie-auto-setup")` khi boot:
+  - Nếu có credentials hợp lệ → tự nối lại WiFi cũ
+  - Nếu chưa có / sai mật khẩu → tự mở portal setup
+- Giữ nút `BOOT` (GPIO0) > 3 giây khi board **đang chạy** để xóa WiFi đã lưu và quay lại flow setup.
+- Credentials được lưu vào NVS (`WiFi.persistent(true)`), nên tắt/mở nguồn vẫn giữ lại.
 
 ---
 
@@ -84,6 +96,26 @@ Trả về trạng thái relay hiện tại:
 
 ```json
 { "pump": true }
+```
+
+### GET `/api/schedule`
+- Đọc lịch hiện tại hoặc cập nhật lịch qua query params.
+- Ví dụ cập nhật:
+
+`/api/schedule?enabled=1&times_csv=06:30,12:00,18:15&weekdays_csv=1,2,3,4,5,6,7&duration_min=3`
+
+Response mẫu:
+
+```json
+{
+  "enabled": true,
+  "hour": 6,
+  "minute": 30,
+  "duration_min": 3,
+  "times_csv": "06:30,12:00,18:15",
+  "weekdays_csv": "1,2,3,4,5,6,7",
+  "running": false
+}
 ```
 
 ---
@@ -128,6 +160,14 @@ Rules test nhanh cho Realtime Database:
     "monthly_stats": {
       ".read": true,
       ".write": true
+    },
+    "pump_history": {
+      ".read": true,
+      ".write": true
+    },
+    "watering_schedule": {
+      ".read": true,
+      ".write": true
     }
   }
 }
@@ -150,10 +190,14 @@ Nếu dùng macOS/Linux, nhớ chỉnh `upload_port` trong [platformio.ini](plat
 ## 7) App Android/iOS
 
 App hỗ trợ:
-- Đọc dữ liệu trực tiếp từ Firebase
-- Bật/tắt tưới từ điện thoại qua Firebase
+- Cùng WiFi: ưu tiên đọc trực tiếp từ ESP32; khác WiFi: fallback Firebase
+- Bật/tắt tưới từ điện thoại (local hoặc Firebase fallback)
 - Chế độ Mock để test UI khi chưa có phần cứng
 - Nút mở nhanh trang setup WiFi ESP32 (`http://192.168.4.1`)
+- Cảnh báo ngưỡng (đất khô / nhiệt độ cao) ngay trên dashboard
+- Màn hình lịch sử tưới đọc từ node `/pump_history`
+- Cấu hình lịch tưới tự động theo giờ + thời lượng
+- Biểu đồ tháng (line + grid) đọc từ node `/monthly_stats`
 
 ### Android
 - Mở thư mục [app](app)
@@ -163,6 +207,7 @@ App hỗ trợ:
 ### iOS
 - Build framework dùng chung:
   - `./gradlew :shared:linkDebugFrameworkIosSimulatorArm64`
+  - Device thật (arm64): `./gradlew :shared:linkDebugFrameworkIosArm64`
 - Mở [app/iosApp/iosApp.xcodeproj](app/iosApp/iosApp.xcodeproj)
 - Chạy trên Simulator hoặc device
 
@@ -175,6 +220,16 @@ App hỗ trợ:
   - `avg_temp`: nhiệt độ trung bình ngày
   - `avg_soil`: độ ẩm đất trung bình ngày
   - `pump_on_count`: số lần bơm bật trong ngày
+- Lịch sử tưới đọc từ Firebase node `/pump_history/{YYYY-MM-DD}/{HHMMSS}`:
+  - `start`: giờ bắt đầu tưới
+  - `end`: giờ kết thúc tưới
+  - `duration_s`: thời lượng (giây)
+- Lịch tưới tự động đọc/ghi tại `/watering_schedule`:
+  - `enabled`: bật/tắt lịch
+  - `times_csv`: nhiều mốc giờ trong ngày, ví dụ `06:30,12:00,18:15`
+  - `weekdays_csv`: thứ chạy dạng `1..7` (T2..CN), ví dụ `1,2,3,4,5`
+  - `hour`, `minute`: giữ để tương thích ngược (mốc đầu tiên)
+  - `duration_min`: thời lượng tưới (1..60 phút)
 
 ### Quy ước thêm tính năng app
 - Mọi tính năng mới của app phải chạy được trên **cả Android và iOS**.
@@ -198,6 +253,7 @@ App hỗ trợ:
 - Cách xử lý:
   - Giữ nút `BOOT` (GPIO0) hơn 3 giây sau khi board chạy để reset WiFi đã lưu.
   - Khởi động lại nguồn ESP32.
+  - Chờ 5-10 giây lúc boot: board sẽ thử auto reconnect trước, chỉ mở portal khi không vào được WiFi đã lưu.
   - Kiểm tra nguồn cấp đủ ổn định (đặc biệt khi relay/van cùng hoạt động).
 
 ### 8.3 App không đọc được dữ liệu Firebase
@@ -216,7 +272,7 @@ App hỗ trợ:
   - `adafruit/DHT sensor library`
   - `adafruit/Adafruit Unified Sensor`
 - Sau khi upload, kiểm tra Serial có log dạng:
-  - `[WiFi] Đã có SSID lưu, thử autoConnect trước.`
+  - `[WiFi] Thử autoConnect trước (tự fallback portal nếu cần)...`
   - `[Firebase] ✅ Đẩy OK (HTTP 200)`
 
 ### 8.4 DHT22 luôn trả `-1`
